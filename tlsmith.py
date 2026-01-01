@@ -502,16 +502,26 @@ def main():
             target = server_name
             if not target:
                 try:
+                    # Use the socket's own address if SNI is missing
                     sockname = ssl_socket.getsockname()
-                    # Only handle IP-based certs if port is 443
-                    if sockname[1] != 443:
-                        return
                     target = sockname[0]
-                except:
+                    # If target is 0.0.0.0, we can't do much without SNI
+                    if target == "0.0.0.0":
+                        logger.warning("SNI missing and socket bound to 0.0.0.0, cannot determine target IP")
+                        return
+                    logger.info(f"SNI missing, using socket IP: {target}")
+                except Exception as e:
+                    logger.error(f"Failed to get sockname: {e}")
                     return
             
             logger.info(f"SNI Callback: targeting {target}")
             try:
+                # The issue might be that aiohttp is already deep in the handshake 
+                # or caching the context. In some versions of OpenSSL/Python,
+                # you must set the context on the *underlying* SSLObject or 
+                # return it from the callback if using SSLContext.sni_callback
+                # but Python's set_servername_callback expects the callback to 
+                # modify the socket's context or return None.
                 new_ctx = ca.get_context_for_host(target)
                 ssl_socket.context = new_ctx
             except Exception as e:
@@ -526,15 +536,26 @@ def main():
             # Listen on all interfaces for port 80
             await web.TCPSite(runner, '0.0.0.0', 80).start()
             
+            # For each intercepted IP, we use a custom context immediately 
+            # if we want to be sure it works without SNI-to-IP resolution issues.
+            for ip in set(ips_to_route):
+                try:
+                    ip_ctx = ca.get_context_for_host(ip)
+                    # We still set the SNI callback just in case someone uses a hostname 
+                    # that points to this IP.
+                    ip_ctx.set_servername_callback(sni_callback)
+                    await web.TCPSite(runner, ip, 443, ssl_context=ip_ctx).start()
+                    logger.info(f"Dedicated listener started for intercepted IP: {ip}")
+                except Exception as e:
+                    logger.error(f"Failed to start listener for {ip}: {e}")
+
+            # For general domain traffic via 127.0.0.1
             ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             ssl_ctx.load_cert_chain(CA_CERT_FILE, CA_KEY_FILE)
             ssl_ctx.set_servername_callback(sni_callback)
+            await web.TCPSite(runner, '127.0.0.1', 443, ssl_context=ssl_ctx).start()
             
-            # Single listener for all TLS traffic on port 443
-            # The sni_callback will handle generating/switching certs for both domains and IPs
-            await web.TCPSite(runner, '0.0.0.0', 443, ssl_context=ssl_ctx).start()
-            
-            logger.info("Listening on 0.0.0.0:80 and 0.0.0.0:443")
+            logger.info("Listening on :80 and :443")
             while True: await asyncio.sleep(3600)
         
         loop.run_until_complete(run_server())
