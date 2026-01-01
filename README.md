@@ -8,6 +8,12 @@ A lab-only tool for intercepting and modifying HTTP/HTTPS traffic with dynamic T
 - **Loopback Bypass**: Uses DNS-over-HTTPS (DoH) to reach real upstreams.
 - **Scriptable**: Python hooks for request/response modification.
 
+## Installation
+Install using `uv`:
+```bash
+uv tool install git+https://github.com/ogpourya/tlsmith.git
+```
+
 ## Usage
 ```bash
 # Intercept domains
@@ -18,7 +24,7 @@ sudo tlsmith 1.1.1.1 --proxy http://localhost:8080
 ```
 
 > [!CAUTION]
-> This tool is **intrusive**. It modifies your routing table and `/etc/hosts`. If it crashes, your internet connectivity for intercepted targets will break. Always run `sudo tlsmith --reset` to recover.
+> This tool is **intrusive**. It modifies your routing table and `/etc/hosts`. If it crashes, your internet connectivity for intercepted targets **might break**. Always run `sudo tlsmith --reset` to recover.
 
 ## Options
 - `--proxy <url>`: Upstream proxy for forwarding.
