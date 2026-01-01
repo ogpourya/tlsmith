@@ -211,19 +211,26 @@ class HostsManager:
 # --- DNS Helper ---
 async def resolve_dns_doh(host: str, doh_url: str) -> str:
     """DNS-over-HTTPS implementation to bypass /etc/hosts."""
-    try:
-        async with aiohttp.ClientSession() as session:
-            params = {"name": host, "type": "A"}
-            headers = {"accept": "application/dns-json"}
-            async with session.get(doh_url, params=params, headers=headers) as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    if "Answer" in data:
-                        for answer in data["Answer"]:
-                            if answer["type"] == 1:  # A record
-                                return answer["data"]
-    except Exception as e:
-        logger.error(f"DoH error for {host} via {doh_url}: {e}")
+    for attempt in range(1, 4):
+        try:
+            async with aiohttp.ClientSession() as session:
+                params = {"name": host, "type": "A"}
+                headers = {"accept": "application/dns-json"}
+                async with session.get(doh_url, params=params, headers=headers) as resp:
+                    if resp.status == 200:
+                        data = await resp.json(content_type=None)
+                        if "Answer" in data:
+                            for answer in data["Answer"]:
+                                if answer["type"] == 1:  # A record
+                                    return answer["data"]
+            if attempt < 3:
+                logger.warning(f"DoH attempt {attempt} failed for {host}, retrying...")
+        except Exception as e:
+            if attempt < 3:
+                logger.warning(f"DoH attempt {attempt} failed for {host}: {e}. Retrying...")
+            else:
+                logger.error(f"jesuss we failed: DoH error for {host} via {doh_url}: {e}")
+                logger.warning("Warning: low quality DNS detected. Consider using a more reliable DoH provider.")
     return None
 
 # --- Traffic Hooks ---
