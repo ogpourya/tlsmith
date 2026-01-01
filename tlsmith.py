@@ -140,7 +140,7 @@ class CertificateAuthority:
         ).not_valid_before(
             datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)
         ).not_valid_after(
-            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)
+            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3650)
         ).add_extension(
             x509.SubjectAlternativeName(san_list), critical=False
         ).sign(self.key, hashes.SHA256())
