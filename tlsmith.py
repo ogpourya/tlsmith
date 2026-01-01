@@ -169,7 +169,20 @@ class CertificateAuthority:
 # --- Routing Manager ---
 class RoutingManager:
     @staticmethod
+    def check_nonlocal_bind():
+        if not sys.platform.startswith("linux"):
+            return
+        try:
+            with open("/proc/sys/net/ipv4/ip_nonlocal_bind", "r") as f:
+                if f.read().strip() != "1":
+                    logger.warning("net.ipv4.ip_nonlocal_bind is NOT enabled.")
+                    logger.warning("IP interception might fail. Fix with: sudo sysctl -w net.ipv4.ip_nonlocal_bind=1")
+        except Exception as e:
+            logger.debug(f"Could not check ip_nonlocal_bind: {e}")
+
+    @staticmethod
     def add_ip_route(ip: str):
+        RoutingManager.check_nonlocal_bind()
         try:
             # Add IP to lo interface so we can bind to it
             subprocess.run(["sudo", "ip", "addr", "add", f"{ip}/32", "dev", "lo"], check=True, capture_output=True)
