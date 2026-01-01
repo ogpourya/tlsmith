@@ -171,21 +171,22 @@ class RoutingManager:
     @staticmethod
     def add_ip_route(ip: str):
         try:
-            subprocess.run(["sudo", "ip", "route", "add", f"{ip}/32", "dev", "lo"], check=True, capture_output=True)
-            logger.info(f"Added route for {ip} to loopback")
+            # Add IP to lo interface so we can bind to it
+            subprocess.run(["sudo", "ip", "addr", "add", f"{ip}/32", "dev", "lo"], check=True, capture_output=True)
+            logger.info(f"Added address {ip} to lo")
         except subprocess.CalledProcessError as e:
             if "File exists" in e.stderr.decode():
-                logger.warning(f"Route for {ip} already exists")
+                logger.warning(f"Address {ip} already exists on lo")
             else:
-                logger.error(f"Failed to add route for {ip}: {e.stderr.decode()}")
+                logger.error(f"Failed to add address {ip}: {e.stderr.decode()}")
 
     @staticmethod
     def remove_ip_route(ip: str):
         try:
-            subprocess.run(["sudo", "ip", "route", "del", f"{ip}/32", "dev", "lo"], check=True, capture_output=True)
-            logger.info(f"Removed route for {ip}")
+            subprocess.run(["sudo", "ip", "addr", "del", f"{ip}/32", "dev", "lo"], check=True, capture_output=True)
+            logger.info(f"Removed address {ip} from lo")
         except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to remove route for {ip}: {e.stderr.decode()}")
+            logger.error(f"Failed to remove address {ip}: {e.stderr.decode()}")
 
 # --- Hosts Manager ---
 class HostsManager:
@@ -237,26 +238,21 @@ class HostsManager:
             else:
                  print(f"No {MARKER} entries found in {HOSTS_FILE}.")
 
-            # Clean up IP routes from 'lo'
+            # Clean up IP addresses from 'lo'
             try:
-                result = subprocess.run(["ip", "route", "show", "dev", "lo"], capture_output=True, text=True)
+                result = subprocess.run(["ip", "addr", "show", "dev", "lo"], capture_output=True, text=True)
                 for line in result.stdout.splitlines():
-                    # Look for single IP routes. 'ip route show dev lo' usually returns '1.2.3.4 scope link'
-                    # Or '1.2.3.4/32 scope link'. We check if it's a valid IP.
-                    parts = line.split()
-                    if not parts: continue
-                    target = parts[0].split('/')[0]
-                    try:
-                        ipaddress.ip_address(target)
-                        # We don't want to remove localhost or common loopback IPs
-                        if target in ("127.0.0.1", "::1"): continue
+                    # Look for 'inet 1.2.3.4/32'
+                    if "inet " in line and "/32" in line:
+                        parts = line.split()
+                        # parts[1] is '1.2.3.4/32'
+                        target = parts[1].split('/')[0]
+                        if target == "127.0.0.1": continue
                         
-                        print(f"Removing lingering route for {target}...")
+                        print(f"Removing lingering address {target} from lo...")
                         RoutingManager.remove_ip_route(target)
-                    except ValueError:
-                        continue
             except Exception as e:
-                logger.error(f"Failed to cleanup routes: {e}")
+                logger.error(f"Failed to cleanup addresses: {e}")
         except Exception as e:
             logger.error(f"Failed to read hosts: {e}")
             return
@@ -404,13 +400,6 @@ async def proxy_handler(request: web.Request):
         logger.error(f"Upstream error: {e}")
         return web.Response(text=f"Upstream Error: {e}", status=502)
 
-def sni_callback(ssl_socket, server_name, initial_context):
-    if not server_name: return
-    try:
-        ssl_socket.context = ca.get_context_for_host(server_name)
-    except Exception as e:
-        logger.error(f"SNI Error: {e}")
-
 # --- Main ---
 ca = CertificateAuthority()
 DNS_SERVER = "https://cloudflare-dns.com/dns-query"
@@ -439,9 +428,6 @@ def main():
 
     if args.reset:
         HostsManager.remove_all()
-        # Clean up any lingering routes if we can find them, but reset usually is broad.
-        # For now, we rely on the marker in hosts, routes don't have a marker.
-        # Users should follow the warning.
         if CA_CERT_FILE.exists(): CA_CERT_FILE.unlink()
         if CA_KEY_FILE.exists(): CA_KEY_FILE.unlink()
         sys.exit(0)
@@ -458,7 +444,6 @@ def main():
     print("[WARNING] IP support requires an upstream --proxy to reach the original destination.")
     print("[WARNING] If this tool crashes, run with --reset to clean up.\n")
     
-    # Store IPs to clean up routes on exit
     intercepted_ips = []
 
     try:
@@ -499,16 +484,59 @@ def main():
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+
+        def sni_callback(ssl_socket, server_name, initial_context):
+            target = server_name
+            if not target:
+                try:
+                    sockname = ssl_socket.getsockname()
+                    # Only handle IP-based certs if port is 443
+                    if sockname[1] != 443:
+                        return
+                    target = sockname[0]
+                except:
+                    return
+            
+            logger.info(f"SNI Callback: targeting {target}")
+            try:
+                new_ctx = ca.get_context_for_host(target)
+                ssl_socket.context = new_ctx
+            except Exception as e:
+                logger.error(f"SNI Error: {e}")
+
         async def run_server():
             app = web.Application()
             app.router.add_route('*', '/{path_info:.*}', proxy_handler)
             runner = web.AppRunner(app)
             await runner.setup()
+            
+            # Listen on all interfaces for port 80
             await web.TCPSite(runner, '0.0.0.0', 80).start()
+            
+            # For domains and general traffic, listen on 0.0.0.0:443
+            # but EXCLUDE the specific IPs we are intercepting if they are already handled.
+            # Actually, we can just bind to specific IPs for everything.
+            
+            intercepted_ip_set = set(ips_to_route)
+            
+            # 1. Start dedicated listeners for each intercepted IP
+            for ip in intercepted_ip_set:
+                ip_ctx = ca.get_context_for_host(ip)
+                await web.TCPSite(runner, ip, 443, ssl_context=ip_ctx).start()
+                logger.info(f"Dedicated IP listener started for {ip}")
+
+            # 2. Start a general listener for everything else (domains)
+            # We bind to 127.0.0.1 for domains (since /etc/hosts points there)
+            # and 0.0.0.0 for any other interface, but we must avoid collisions.
+            
             ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             ssl_ctx.load_cert_chain(CA_CERT_FILE, CA_KEY_FILE)
             ssl_ctx.set_servername_callback(sni_callback)
-            await web.TCPSite(runner, '0.0.0.0', 443, ssl_context=ssl_ctx).start()
+            
+            # If we are intercepting IPs, we already bound to them on port 443.
+            # To handle domains, we can bind to 127.0.0.1:443 specifically.
+            await web.TCPSite(runner, '127.0.0.1', 443, ssl_context=ssl_ctx).start()
+            
             logger.info("Listening on :80 and :443")
             while True: await asyncio.sleep(3600)
         

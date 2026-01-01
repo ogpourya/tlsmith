@@ -85,7 +85,8 @@ echo "Running HTTPS test..."
 DIRECT_IP=$(curl -s https://icanhazip.com || echo "DIRECT_FAILED")
 echo "Direct IP: $DIRECT_IP"
 
-OUTPUT_HTTPS=$(curl -v --connect-to icanhazip.com:443:127.0.0.1:10443 --cacert "$CA_CERT" https://icanhazip.com 2>&1) || echo "CURL FAILED: $?"
+# Use normal curl as /etc/hosts handles redirection to 127.0.0.1
+OUTPUT_HTTPS=$(curl -v --cacert "$CA_CERT" https://icanhazip.com 2>&1) || echo "CURL FAILED: $?"
 PROXY_IP_HTTPS=$(echo "$OUTPUT_HTTPS" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || echo "FAILED_TO_GET_IP")
 echo "Returned IP (HTTPS): $PROXY_IP_HTTPS"
 echo "$OUTPUT_HTTPS"
@@ -100,7 +101,8 @@ fi
 # --- Test 2: HTTP ---
 echo "----------------------------------------------------------------"
 echo "Running HTTP test..."
-OUTPUT_HTTP=$(curl -v --connect-to icanhazip.com:80:127.0.0.1:10080 http://icanhazip.com 2>&1)
+# Use normal curl as /etc/hosts handles redirection to 127.0.0.1
+OUTPUT_HTTP=$(curl -v http://icanhazip.com 2>&1)
 PROXY_IP_HTTP=$(echo "$OUTPUT_HTTP" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || echo "FAILED_TO_GET_IP")
 echo "Returned IP (HTTP): $PROXY_IP_HTTP"
 echo "$OUTPUT_HTTP"
