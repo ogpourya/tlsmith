@@ -51,7 +51,7 @@ Run with: `sudo tlsmith --script my_hooks.py example.com`
 ## Options
 
 - `--reset`: Remove CA and configuration files, clean up `/etc/hosts`, then exit.
-- `--doh <url>`: Specify a custom DNS-over-HTTPS resolver (default: `https://sky.rethinkdns.com/dns-query`).
+- `--dns <ip>`: Specify a custom DNS server to bypass `/etc/hosts` for upstream resolution (default: `8.8.8.8`).
 - `--script <path>`: Load Python script for request/response modification.
 
 ## Safety Warning

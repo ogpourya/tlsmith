@@ -11,6 +11,9 @@ from typing import Optional, Dict
 from pathlib import Path
 import shutil
 import base64
+import socket
+import struct
+import random
 
 import aiohttp
 from aiohttp import web
@@ -206,56 +209,52 @@ class HostsManager:
             logger.error(f"Sudo write failed: {err.decode()}")
 
 # --- DNS Helper ---
-def make_dns_query(host: str) -> bytes:
-    import struct
-    import random
-    tid = random.randint(0, 65535)
-    header = struct.pack("!HHHHHH", tid, 0x0100, 1, 0, 0, 0)
-    qname = b""
-    for part in host.split("."):
-        qname += bytes([len(part)]) + part.encode("ascii")
-    qname += b"\x00"
-    return header + qname + struct.pack("!HH", 1, 1)
+def resolve_dns(host: str, server: str) -> str:
+    """Pure DNS implementation to bypass /etc/hosts."""
+    def make_query(hostname):
+        tid = random.randint(0, 65535)
+        header = struct.pack("!HHHHHH", tid, 0x0100, 1, 0, 0, 0)
+        qname = b""
+        for part in hostname.split("."):
+            qname += bytes([len(part)]) + part.encode("ascii")
+        qname += b"\x00"
+        return header + qname + struct.pack("!HH", 1, 1)
 
-def parse_dns_response(data: bytes) -> str:
-    import struct
-    idx = 12
-    while idx < len(data):
-        length = data[idx]
-        if length == 0:
-            idx += 1
-            break
-        idx += length + 1
-    idx += 4
-    ancount = struct.unpack("!H", data[6:8])[0]
-    if ancount == 0: return ""
-    for _ in range(ancount):
-        if idx >= len(data): break
-        if data[idx] & 0xC0 == 0xC0: idx += 2
-        else:
-            while idx < len(data) and data[idx] != 0:
-                idx += data[idx] + 1
-            idx += 1
-        if idx + 10 > len(data): break
-        type, _class, ttl, rdlength = struct.unpack("!HHIH", data[idx:idx+10])
-        idx += 10
-        if type == 1 and _class == 1 and rdlength == 4:
-            return ".".join(str(b) for b in data[idx:idx+4])
-        idx += rdlength
-    return ""
+    def parse_response(data):
+        idx = 12
+        while idx < len(data):
+            length = data[idx]
+            if length == 0:
+                idx += 1
+                break
+            idx += length + 1
+        idx += 4
+        ancount = struct.unpack("!H", data[6:8])[0]
+        for _ in range(ancount):
+            if idx >= len(data): break
+            if data[idx] & 0xC0 == 0xC0: idx += 2
+            else:
+                while idx < len(data) and data[idx] != 0:
+                    idx += data[idx] + 1
+                idx += 1
+            if idx + 10 > len(data): break
+            rtype, rclass, ttl, rdlength = struct.unpack("!HHIH", data[idx:idx+10])
+            idx += 10
+            if rtype == 1 and rclass == 1 and rdlength == 4:
+                return ".".join(str(b) for b in data[idx:idx+4])
+            idx += rdlength
+        return None
 
-async def resolve_doh(host: str, doh_url: str) -> str:
-    query = make_dns_query(host)
-    async with aiohttp.ClientSession() as session:
-        headers = {"Accept": "application/dns-message", "Content-Type": "application/dns-message"}
-        try:
-            async with session.post(doh_url, data=query, headers=headers, timeout=5) as resp:
-                if resp.status == 200:
-                    data = await resp.read()
-                    return parse_dns_response(data)
-        except Exception as e:
-            logger.error(f"DoH error for {host} via {doh_url}: {e}")
-    return ""
+    try:
+        query = make_query(host)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(5)
+        sock.sendto(query, (server, 53))
+        data, _ = sock.recvfrom(512)
+        return parse_response(data)
+    except Exception as e:
+        logger.error(f"DNS error for {host} via {server}: {e}")
+    return None
 
 # --- Traffic Hooks ---
 async def default_intercept_response(body: bytes, headers: dict, status: int) -> tuple[bytes, dict, int]:
@@ -292,8 +291,8 @@ async def proxy_handler(request: web.Request):
                 real_ip = ip
                 break
         if not real_ip:
-            logger.info(f"Loopback detected for {hostname}, bypassing via DoH ({DOH_URL})...")
-            real_ip = await resolve_doh(hostname, DOH_URL)
+            logger.info(f"Loopback detected for {hostname}, bypassing via DNS ({DNS_SERVER})...")
+            real_ip = await asyncio.get_event_loop().run_in_executor(None, resolve_dns, hostname, DNS_SERVER)
         if not real_ip:
             return web.Response(text=f"Could not resolve {hostname}", status=502)
     except Exception as e:
@@ -306,11 +305,7 @@ async def proxy_handler(request: web.Request):
 
     req_headers = {k: v for k, v in request.headers.items() if k.lower() not in ('host', 'content-length', 'connection')}
     req_headers['Host'] = host
-    # aiohttp handles connection management, so we remove 'connection' from request headers
-    # and we definitely should not be sending 'transfer-encoding' if we read the whole body
-    if 'transfer-encoding' in req_headers:
-        del req_headers['transfer-encoding']
-    
+    if 'transfer-encoding' in req_headers: del req_headers['transfer-encoding']
     req_body = await request.read()
     
     ssl_ctx_upstream = None
@@ -329,14 +324,10 @@ async def proxy_handler(request: web.Request):
                 body = await resp.read()
                 out_headers = {}
                 for k, v in resp.headers.items():
-                    # aiohttp response headers keys/values are strings
                     k_lower = k.lower()
                     if k_lower not in ('content-length', 'content-encoding', 'transfer-encoding', 'connection', 'server'):
                         out_headers[k] = v
-                
-                # Apply hook
                 body, out_headers, status = await intercept_response_hook(body, out_headers, resp.status)
-                
                 return web.Response(body=body, status=status, headers=out_headers)
     except Exception as e:
         logger.error(f"Upstream error: {e}")
@@ -351,15 +342,15 @@ def sni_callback(ssl_socket, server_name, initial_context):
 
 # --- Main ---
 ca = CertificateAuthority()
-DOH_URL = "https://sky.rethinkdns.com/dns-query"
+DNS_SERVER = "8.8.8.8"
 
 import argparse
 
 def main():
-    global DOH_URL
+    global DNS_SERVER
     parser = argparse.ArgumentParser(description="MITM Proxy & Host Spoofer")
     parser.add_argument("--reset", action="store_true", help="Remove CA and config, then exit")
-    parser.add_argument("--doh", default="https://sky.rethinkdns.com/dns-query", help="DoH Resolver URL")
+    parser.add_argument("--dns", default="8.8.8.8", help="DNS Server to bypass hosts file")
     parser.add_argument("--script", help="Path to Python script with interception hooks")
     parser.add_argument("domains", nargs="*", help="Domains to intercept.")
     args = parser.parse_args()
@@ -371,7 +362,7 @@ def main():
         if CA_KEY_FILE.exists(): CA_KEY_FILE.unlink()
         sys.exit(0)
 
-    DOH_URL = args.doh
+    DNS_SERVER = args.dns
     if args.script: load_script(args.script)
 
     if args.domains:
