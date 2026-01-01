@@ -209,51 +209,21 @@ class HostsManager:
             logger.error(f"Sudo write failed: {err.decode()}")
 
 # --- DNS Helper ---
-def resolve_dns(host: str, server: str) -> str:
-    """Pure DNS implementation to bypass /etc/hosts."""
-    def make_query(hostname):
-        tid = random.randint(0, 65535)
-        header = struct.pack("!HHHHHH", tid, 0x0100, 1, 0, 0, 0)
-        qname = b""
-        for part in hostname.split("."):
-            qname += bytes([len(part)]) + part.encode("ascii")
-        qname += b"\x00"
-        return header + qname + struct.pack("!HH", 1, 1)
-
-    def parse_response(data):
-        idx = 12
-        while idx < len(data):
-            length = data[idx]
-            if length == 0:
-                idx += 1
-                break
-            idx += length + 1
-        idx += 4
-        ancount = struct.unpack("!H", data[6:8])[0]
-        for _ in range(ancount):
-            if idx >= len(data): break
-            if data[idx] & 0xC0 == 0xC0: idx += 2
-            else:
-                while idx < len(data) and data[idx] != 0:
-                    idx += data[idx] + 1
-                idx += 1
-            if idx + 10 > len(data): break
-            rtype, rclass, ttl, rdlength = struct.unpack("!HHIH", data[idx:idx+10])
-            idx += 10
-            if rtype == 1 and rclass == 1 and rdlength == 4:
-                return ".".join(str(b) for b in data[idx:idx+4])
-            idx += rdlength
-        return None
-
+async def resolve_dns_doh(host: str, doh_url: str) -> str:
+    """DNS-over-HTTPS implementation to bypass /etc/hosts."""
     try:
-        query = make_query(host)
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(5)
-        sock.sendto(query, (server, 53))
-        data, _ = sock.recvfrom(512)
-        return parse_response(data)
+        async with aiohttp.ClientSession() as session:
+            params = {"name": host, "type": "A"}
+            headers = {"accept": "application/dns-json"}
+            async with session.get(doh_url, params=params, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    if "Answer" in data:
+                        for answer in data["Answer"]:
+                            if answer["type"] == 1:  # A record
+                                return answer["data"]
     except Exception as e:
-        logger.error(f"DNS error for {host} via {server}: {e}")
+        logger.error(f"DoH error for {host} via {doh_url}: {e}")
     return None
 
 # --- Traffic Hooks ---
@@ -280,7 +250,11 @@ def load_script(path: str):
 async def proxy_handler(request: web.Request):
     host = request.host
     hostname = host.split(":")[0] if ":" in host else host
+    
     logger.info(f"{request.method} {request.url}")
+    if logger.level <= logging.DEBUG:
+        logger.debug(f"--- Incoming Request ---")
+        logger.debug(f"Headers: {dict(request.headers)}")
 
     real_ip = None
     try:
@@ -291,8 +265,8 @@ async def proxy_handler(request: web.Request):
                 real_ip = ip
                 break
         if not real_ip:
-            logger.info(f"Loopback detected for {hostname}, bypassing via DNS ({DNS_SERVER})...")
-            real_ip = await asyncio.get_event_loop().run_in_executor(None, resolve_dns, hostname, DNS_SERVER)
+            logger.info(f"Loopback detected for {hostname}, bypassing via DoH ({DNS_SERVER})...")
+            real_ip = await resolve_dns_doh(hostname, DNS_SERVER)
         if not real_ip:
             return web.Response(text=f"Could not resolve {hostname}", status=502)
     except Exception as e:
@@ -307,6 +281,11 @@ async def proxy_handler(request: web.Request):
     req_headers['Host'] = host
     if 'transfer-encoding' in req_headers: del req_headers['transfer-encoding']
     req_body = await request.read()
+    if logger.level <= logging.DEBUG and req_body:
+        try:
+            logger.debug(f"Request Body: {req_body.decode('utf-8', errors='replace')}")
+        except Exception:
+            logger.debug(f"Request Body: <binary data {len(req_body)} bytes>")
     
     ssl_ctx_upstream = None
     if scheme == 'https':
@@ -315,13 +294,22 @@ async def proxy_handler(request: web.Request):
         ssl_ctx_upstream.verify_mode = ssl.CERT_NONE
 
     try:
-        async with aiohttp.ClientSession(auto_decompress=False) as session:
+        async with aiohttp.ClientSession(auto_decompress=True) as session:
             async with session.request(
                 request.method, target_url, headers=req_headers, data=req_body,
                 ssl=ssl_ctx_upstream, server_hostname=hostname if scheme == 'https' else None,
                 allow_redirects=False
             ) as resp:
                 body = await resp.read()
+                if logger.level <= logging.DEBUG:
+                    logger.debug(f"--- Outgoing Response ---")
+                    logger.debug(f"Status: {resp.status}")
+                    logger.debug(f"Headers: {dict(resp.headers)}")
+                    try:
+                        logger.debug(f"Response Body: {body.decode('utf-8', errors='replace')}")
+                    except Exception:
+                        logger.debug(f"Response Body: <binary data {len(body)} bytes>")
+                
                 out_headers = {}
                 for k, v in resp.headers.items():
                     k_lower = k.lower()
@@ -342,7 +330,7 @@ def sni_callback(ssl_socket, server_name, initial_context):
 
 # --- Main ---
 ca = CertificateAuthority()
-DNS_SERVER = "8.8.8.8"
+DNS_SERVER = "https://cloudflare-dns.com/dns-query"
 
 import argparse
 
@@ -350,12 +338,18 @@ def main():
     global DNS_SERVER
     parser = argparse.ArgumentParser(description="MITM Proxy & Host Spoofer")
     parser.add_argument("--reset", action="store_true", help="Remove CA and config, then exit")
-    parser.add_argument("--dns", default="8.8.8.8", help="DNS Server to bypass hosts file")
+    parser.add_argument("--dns", default="https://cloudflare-dns.com/dns-query", help="DoH Server URL to bypass hosts file")
     parser.add_argument("--script", help="Path to Python script with interception hooks")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Show verbose request/response logs")
     parser.add_argument("domains", nargs="*", help="Domains to intercept.")
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+    else:
+        logger.setLevel(logging.INFO)
+
+    logging.basicConfig(level=logger.level, format="%(asctime)s - %(message)s")
     if args.reset:
         HostsManager.remove_all()
         if CA_CERT_FILE.exists(): CA_CERT_FILE.unlink()

@@ -4,7 +4,8 @@ A lab-only tool for intercepting and modifying HTTP/HTTPS traffic with dynamic T
 
 ## Features
 - **Dynamic TLS**: Generates leaf certificates on-the-fly for any domain using a local Root CA.
-- **Loopback Bypass**: Intelligently bypasses local `/etc/hosts` overrides using DNS-over-HTTPS.
+- **Loopback Bypass**: Intelligently bypasses local `/etc/hosts` overrides using DNS-over-HTTPS (DoH).
+- **Clean Logging**: Decodes and decompresses (gzip/deflate) HTTP bodies for clear inspection when using verbose mode.
 - **Scriptable**: Python-based proxy logic for easy request/response modification.
 
 ## Installation
@@ -17,17 +18,17 @@ uv tool install git+https://github.com/ogpourya/tlsmith.git
 
 ## Usage
 
-Run with `sudo` (required for ports 80/443 and `/etc/hosts` modification):
+Run with `sudo` (required for ports 80/443 and `/etc/hosts` modification). If `sudo tlsmith` is not found in your path, use the `$(which tlsmith)` subshell:
 
 ```bash
+sudo tlsmith example.com
+# Fallback if not in sudo path:
 sudo $(which tlsmith) example.com google.com
-# OR
-sudo $(which tlsmith) domains.txt
 ```
 
 1. **Trust CA**: On first run, a Root CA is generated at `~/.config/tlsmith/ca.crt`. Import this into your browser/OS trust store (or run on Debian/Ubuntu for auto-install).
 2. **Intercepts**: `tlsmith` automatically updates `/etc/hosts` to point these domains to `127.0.0.1`.
-3. **Proxies**: Traffic is decrypted, modified (if --script provided), and forwarded to the *real* upstream via DNS-over-HTTPS.
+3. **Proxies**: Traffic is decrypted, decompressed for logging, modified (if --script provided), and forwarded to the *real* upstream via DNS-over-HTTPS.
 
 ## Scripting
 
@@ -46,19 +47,20 @@ async def intercept_response(body: bytes, headers: dict, status: int) -> tuple[b
     return body, headers, status
 ```
 
-Run with: `sudo tlsmith --script my_hooks.py example.com`
+Run with: `sudo tlsmith --script my_hooks.py example.com` (or `sudo $(which tlsmith) ...`)
 
 ## Options
 
 - `--reset`: Remove CA and configuration files, clean up `/etc/hosts`, then exit.
-- `--dns <ip>`: Specify a custom DNS server to bypass `/etc/hosts` for upstream resolution (default: `8.8.8.8`).
+- `--dns <url>`: Specify a custom DoH server URL to bypass `/etc/hosts` for upstream resolution (default: Cloudflare).
 - `--script <path>`: Load Python script for request/response modification.
+- `-v`, `--verbose`: Enable verbose logging to see incoming and outgoing request/response headers and decompressed bodies.
 
 ## Safety Warning
 
 **Use with caution.** This tool modifies `/etc/hosts` to hijack traffic.
 - If the tool crashes or is killed abruptly (SIGKILL), your `/etc/hosts` file may be left in a modified state, breaking connectivity for the spoofed domains.
-- **Fix:** Run `sudo tlsmith --reset` to clean up, or manually edit `/etc/hosts` to remove the `# tlsmith` entries.
+- **Fix:** Run `sudo tlsmith --reset` (or `sudo $(which tlsmith) --reset`) to clean up, or manually edit `/etc/hosts` to remove the `# tlsmith` entries.
 - Always verify the generated Root CA is trusted only for development purposes.
 
 ## License

@@ -27,7 +27,7 @@ uv sync
 echo "Starting tlsmith with CLI args..."
 # Note: tlsmith handles /etc/hosts injection.
 # We use hooks.py to enable the Date header modification for testing
-uv run tlsmith.py --script hooks.py example.com > "$LOG_FILE" 2>&1 &
+uv run tlsmith.py --script hooks.py example.com -v > "$LOG_FILE" 2>&1 &
 PID=$!
 
 echo "Waiting for server to start (10s)..."
