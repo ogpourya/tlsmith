@@ -524,34 +524,17 @@ def main():
             await runner.setup()
             
             # Listen on all interfaces for port 80
-            site_80 = web.TCPSite(runner, '0.0.0.0', 80)
-            try:
-                await site_80.start()
-            except OSError as e:
-                logger.error(f"Failed to bind 80: {e}")
-
-            intercepted_ip_set = set(ips_to_route)
+            await web.TCPSite(runner, '0.0.0.0', 80).start()
             
-            for ip in intercepted_ip_set:
-                ip_ctx = ca.get_context_for_host(ip)
-                try:
-                    await web.TCPSite(runner, ip, 443, ssl_context=ip_ctx).start()
-                    logger.info(f"Dedicated IP listener started for {ip}")
-                except OSError as e:
-                    logger.error(f"Failed to bind {ip}:443: {e}")
-
             ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             ssl_ctx.load_cert_chain(CA_CERT_FILE, CA_KEY_FILE)
             ssl_ctx.set_servername_callback(sni_callback)
             
-            try:
-                await web.TCPSite(runner, '0.0.0.0', 443, ssl_context=ssl_ctx).start()
-            except OSError as e:
-                logger.error(f"Failed to bind 0.0.0.0:443: {e}")
-                logger.info("Attempting bind to 127.0.0.1:443 as fallback...")
-                await web.TCPSite(runner, '127.0.0.1', 443, ssl_context=ssl_ctx).start()
+            # Single listener for all TLS traffic on port 443
+            # The sni_callback will handle generating/switching certs for both domains and IPs
+            await web.TCPSite(runner, '0.0.0.0', 443, ssl_context=ssl_ctx).start()
             
-            logger.info("Listening on :80 and :443")
+            logger.info("Listening on 0.0.0.0:80 and 0.0.0.0:443")
             while True: await asyncio.sleep(3600)
         
         loop.run_until_complete(run_server())
