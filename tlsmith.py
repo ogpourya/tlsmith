@@ -14,6 +14,7 @@ import base64
 import socket
 import struct
 import random
+import ipaddress
 
 import aiohttp
 from aiohttp import web
@@ -117,8 +118,17 @@ class CertificateAuthority:
             self.installed = True
 
     def get_context_for_host(self, hostname: str) -> ssl.SSLContext:
+        try:
+            ip_addr = ipaddress.ip_address(hostname)
+            is_ip = True
+        except ValueError:
+            is_ip = False
+
         key = ec.generate_private_key(ec.SECP256R1())
         subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, hostname)])
+        
+        san_list = [x509.IPAddress(ip_addr)] if is_ip else [x509.DNSName(hostname)]
+        
         cert = x509.CertificateBuilder().subject_name(
             subject
         ).issuer_name(
@@ -132,7 +142,7 @@ class CertificateAuthority:
         ).not_valid_after(
             datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)
         ).add_extension(
-            x509.SubjectAlternativeName([x509.DNSName(hostname)]), critical=False
+            x509.SubjectAlternativeName(san_list), critical=False
         ).sign(self.key, hashes.SHA256())
 
         key_pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
@@ -156,11 +166,40 @@ class CertificateAuthority:
             os.unlink(cpath)
         return ctx
 
+# --- Routing Manager ---
+class RoutingManager:
+    @staticmethod
+    def add_ip_route(ip: str):
+        try:
+            subprocess.run(["sudo", "ip", "route", "add", f"{ip}/32", "dev", "lo"], check=True, capture_output=True)
+            logger.info(f"Added route for {ip} to loopback")
+        except subprocess.CalledProcessError as e:
+            if "File exists" in e.stderr.decode():
+                logger.warning(f"Route for {ip} already exists")
+            else:
+                logger.error(f"Failed to add route for {ip}: {e.stderr.decode()}")
+
+    @staticmethod
+    def remove_ip_route(ip: str):
+        try:
+            subprocess.run(["sudo", "ip", "route", "del", f"{ip}/32", "dev", "lo"], check=True, capture_output=True)
+            logger.info(f"Removed route for {ip}")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to remove route for {ip}: {e.stderr.decode()}")
+
 # --- Hosts Manager ---
 class HostsManager:
     @staticmethod
     def add_domain(domain: str):
-        if domain.startswith("www."):
+        try:
+            ipaddress.ip_address(domain)
+            is_ip = True
+        except ValueError:
+            is_ip = False
+
+        if is_ip:
+            domains = {domain}
+        elif domain.startswith("www."):
             base = domain[4:]
             domains = {base, domain}
         else:
@@ -188,17 +227,39 @@ class HostsManager:
     @staticmethod
     def remove_all():
         try:
+            # Clean up /etc/hosts
             with open(HOSTS_FILE, 'r') as f:
                 lines = f.readlines()
+            new_lines = [line for line in lines if MARKER not in line]
+            if len(new_lines) != len(lines):
+                 HostsManager._write_hosts(new_lines)
+                 print(f"Removed {len(lines) - len(new_lines)} entries from {HOSTS_FILE}")
+            else:
+                 print(f"No {MARKER} entries found in {HOSTS_FILE}.")
+
+            # Clean up IP routes from 'lo'
+            try:
+                result = subprocess.run(["ip", "route", "show", "dev", "lo"], capture_output=True, text=True)
+                for line in result.stdout.splitlines():
+                    # Look for single IP routes. 'ip route show dev lo' usually returns '1.2.3.4 scope link'
+                    # Or '1.2.3.4/32 scope link'. We check if it's a valid IP.
+                    parts = line.split()
+                    if not parts: continue
+                    target = parts[0].split('/')[0]
+                    try:
+                        ipaddress.ip_address(target)
+                        # We don't want to remove localhost or common loopback IPs
+                        if target in ("127.0.0.1", "::1"): continue
+                        
+                        print(f"Removing lingering route for {target}...")
+                        RoutingManager.remove_ip_route(target)
+                    except ValueError:
+                        continue
+            except Exception as e:
+                logger.error(f"Failed to cleanup routes: {e}")
         except Exception as e:
             logger.error(f"Failed to read hosts: {e}")
             return
-        new_lines = [line for line in lines if MARKER not in line]
-        if len(new_lines) != len(lines):
-             HostsManager._write_hosts(new_lines)
-             print(f"Removed {len(lines) - len(new_lines)} entries from {HOSTS_FILE}")
-        else:
-             print(f"No {MARKER} entries found in {HOSTS_FILE}.")
 
     @staticmethod
     def _write_hosts(lines):
@@ -258,27 +319,36 @@ async def proxy_handler(request: web.Request):
     host = request.host
     hostname = host.split(":")[0] if ":" in host else host
     
+    try:
+        ipaddress.ip_address(hostname)
+        is_hostname_ip = True
+    except ValueError:
+        is_hostname_ip = False
+
     logger.info(f"{request.method} {request.url}")
     if logger.level <= logging.DEBUG:
         logger.debug(f"--- Incoming Request ---")
         logger.debug(f"Headers: {dict(request.headers)}")
 
     real_ip = None
-    try:
-        info = await asyncio.get_event_loop().getaddrinfo(hostname, None)
-        ips = [x[4][0] for x in info]
-        for ip in ips:
-            if not ip.startswith("127.") and ip != "::1":
-                real_ip = ip
-                break
-        if not real_ip:
-            logger.info(f"Loopback detected for {hostname}, bypassing via DoH ({DNS_SERVER})...")
-            real_ip = await resolve_dns_doh(hostname, DNS_SERVER)
-        if not real_ip:
-            return web.Response(text=f"Could not resolve {hostname}", status=502)
-    except Exception as e:
-        logger.error(f"Resolution error: {e}")
-        return web.Response(text="DNS Error", status=502)
+    if is_hostname_ip:
+        real_ip = hostname
+    else:
+        try:
+            info = await asyncio.get_event_loop().getaddrinfo(hostname, None)
+            ips = [x[4][0] for x in info]
+            for ip in ips:
+                if not ip.startswith("127.") and ip != "::1":
+                    real_ip = ip
+                    break
+            if not real_ip:
+                logger.info(f"Loopback detected for {hostname}, bypassing via DoH ({DNS_SERVER})...")
+                real_ip = await resolve_dns_doh(hostname, DNS_SERVER)
+            if not real_ip:
+                return web.Response(text=f"Could not resolve {hostname}", status=502)
+        except Exception as e:
+            logger.error(f"Resolution error: {e}")
+            return web.Response(text="DNS Error", status=502)
 
     scheme = request.scheme
     port = request.url.port or (443 if scheme == 'https' else 80)
@@ -354,8 +424,6 @@ def main():
     parser.add_argument("--reset", action="store_true", help="Remove CA and config, then exit")
     parser.add_argument("--dns", default="https://cloudflare-dns.com/dns-query", help="DoH Server URL to bypass hosts file")
     parser.add_argument("--proxy", help="Upstream proxy URL (e.g. http://localhost:3333)")
-    parser.add_argument("--port", type=int, default=80, help="HTTP listen port")
-    parser.add_argument("--tls-port", type=int, default=443, help="HTTPS listen port")
     parser.add_argument("--script", help="Path to Python script with interception hooks")
     parser.add_argument("-v", "--verbose", action="store_true", help="Show verbose request/response logs")
     parser.add_argument("domains", nargs="*", help="Domains to intercept.")
@@ -371,6 +439,9 @@ def main():
 
     if args.reset:
         HostsManager.remove_all()
+        # Clean up any lingering routes if we can find them, but reset usually is broad.
+        # For now, we rely on the marker in hosts, routes don't have a marker.
+        # Users should follow the warning.
         if CA_CERT_FILE.exists(): CA_CERT_FILE.unlink()
         if CA_KEY_FILE.exists(): CA_KEY_FILE.unlink()
         sys.exit(0)
@@ -383,35 +454,70 @@ def main():
     PROXY_URL = args.proxy
     if args.script: load_script(args.script)
 
-    print("\n[WARNING] Modifying /etc/hosts to intercept traffic.")
+    print("\n[WARNING] Modifying /etc/hosts and routing table to intercept traffic.")
+    print("[WARNING] IP support requires an upstream --proxy to reach the original destination.")
     print("[WARNING] If this tool crashes, run with --reset to clean up.\n")
-    domains_to_add = []
-    for d in args.domains:
-        path = Path(d)
-        if path.exists() and path.is_file():
-            with open(path, 'r') as f: domains_to_add.extend([line.strip() for line in f if line.strip()])
-        else: domains_to_add.extend(d.split(","))
-    for d in set(domains_to_add):
-        if d: HostsManager.add_domain(d.strip())
+    
+    # Store IPs to clean up routes on exit
+    intercepted_ips = []
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    async def run_server():
-        app = web.Application()
-        app.router.add_route('*', '/{path_info:.*}', proxy_handler)
-        runner = web.AppRunner(app)
-        await runner.setup()
-        await web.TCPSite(runner, '0.0.0.0', args.port).start()
-        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ssl_ctx.load_cert_chain(CA_CERT_FILE, CA_KEY_FILE)
-        ssl_ctx.set_servername_callback(sni_callback)
-        await web.TCPSite(runner, '0.0.0.0', args.tls_port, ssl_context=ssl_ctx).start()
-        logger.info(f"Listening on :{args.port} and :{args.tls_port}")
-        while True: await asyncio.sleep(3600)
     try:
+        domains_to_add = []
+        ips_to_route = []
+        for d in args.domains:
+            path = Path(d)
+            if path.exists() and path.is_file():
+                with open(path, 'r') as f: 
+                    for line in f:
+                        item = line.strip()
+                        if item:
+                            try:
+                                ipaddress.ip_address(item)
+                                ips_to_route.append(item)
+                            except ValueError:
+                                domains_to_add.append(item)
+            else:
+                for item in d.split(","):
+                    item = item.strip()
+                    if item:
+                        try:
+                            ipaddress.ip_address(item)
+                            ips_to_route.append(item)
+                        except ValueError:
+                            domains_to_add.append(item)
+
+        if ips_to_route and not PROXY_URL:
+            logger.error("IP interception requires an upstream --proxy. Exit.")
+            sys.exit(1)
+
+        for d in set(domains_to_add):
+            HostsManager.add_domain(d)
+        
+        for ip in set(ips_to_route):
+            RoutingManager.add_ip_route(ip)
+            intercepted_ips.append(ip)
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        async def run_server():
+            app = web.Application()
+            app.router.add_route('*', '/{path_info:.*}', proxy_handler)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            await web.TCPSite(runner, '0.0.0.0', 80).start()
+            ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ssl_ctx.load_cert_chain(CA_CERT_FILE, CA_KEY_FILE)
+            ssl_ctx.set_servername_callback(sni_callback)
+            await web.TCPSite(runner, '0.0.0.0', 443, ssl_context=ssl_ctx).start()
+            logger.info("Listening on :80 and :443")
+            while True: await asyncio.sleep(3600)
+        
         loop.run_until_complete(run_server())
     except KeyboardInterrupt:
         pass
+    finally:
+        for ip in intercepted_ips:
+            RoutingManager.remove_ip_route(ip)
 
 if __name__ == "__main__":
     main()

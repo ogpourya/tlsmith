@@ -35,7 +35,7 @@ fi
 
 echo "Starting tlsmith with CLI args..."
 # tlsmith handles /etc/hosts injection and uses hooks.py for Date header modification
-uv run tlsmith.py icanhazip.com --proxy http://localhost:3333 --port 10080 --tls-port 10443 --script hooks.py  -v > "$LOG_FILE" 2>&1 &
+uv run tlsmith.py icanhazip.com --proxy http://localhost:3333 --script hooks.py  -v > "$LOG_FILE" 2>&1 &
 PID=$!
 
 echo "Waiting for server to start (10s)..."
