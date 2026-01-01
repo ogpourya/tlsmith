@@ -1,0 +1,17 @@
+[project]
+name = "tlsmith"
+version = "1.0.0"
+description = "Traffic Interceptor & Modifier"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiohttp>=3.13.2",
+    "cryptography>=46.0.3",
+]
+
+[project.scripts]
+tlsmith = "tlsmith:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
