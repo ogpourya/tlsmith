@@ -524,31 +524,32 @@ def main():
             await runner.setup()
             
             # Listen on all interfaces for port 80
-            await web.TCPSite(runner, '0.0.0.0', 80).start()
-            
-            # For domains and general traffic, listen on 0.0.0.0:443
-            # but EXCLUDE the specific IPs we are intercepting if they are already handled.
-            # Actually, we can just bind to specific IPs for everything.
-            
+            site_80 = web.TCPSite(runner, '0.0.0.0', 80)
+            try:
+                await site_80.start()
+            except OSError as e:
+                logger.error(f"Failed to bind 80: {e}")
+
             intercepted_ip_set = set(ips_to_route)
             
-            # 1. Start dedicated listeners for each intercepted IP
             for ip in intercepted_ip_set:
                 ip_ctx = ca.get_context_for_host(ip)
-                await web.TCPSite(runner, ip, 443, ssl_context=ip_ctx).start()
-                logger.info(f"Dedicated IP listener started for {ip}")
+                try:
+                    await web.TCPSite(runner, ip, 443, ssl_context=ip_ctx).start()
+                    logger.info(f"Dedicated IP listener started for {ip}")
+                except OSError as e:
+                    logger.error(f"Failed to bind {ip}:443: {e}")
 
-            # 2. Start a general listener for everything else (domains)
-            # We bind to 127.0.0.1 for domains (since /etc/hosts points there)
-            # and 0.0.0.0 for any other interface, but we must avoid collisions.
-            
             ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             ssl_ctx.load_cert_chain(CA_CERT_FILE, CA_KEY_FILE)
             ssl_ctx.set_servername_callback(sni_callback)
             
-            # If we are intercepting IPs, we already bound to them on port 443.
-            # To handle domains, we can bind to 127.0.0.1:443 specifically.
-            await web.TCPSite(runner, '127.0.0.1', 443, ssl_context=ssl_ctx).start()
+            try:
+                await web.TCPSite(runner, '0.0.0.0', 443, ssl_context=ssl_ctx).start()
+            except OSError as e:
+                logger.error(f"Failed to bind 0.0.0.0:443: {e}")
+                logger.info("Attempting bind to 127.0.0.1:443 as fallback...")
+                await web.TCPSite(runner, '127.0.0.1', 443, ssl_context=ssl_ctx).start()
             
             logger.info("Listening on :80 and :443")
             while True: await asyncio.sleep(3600)
