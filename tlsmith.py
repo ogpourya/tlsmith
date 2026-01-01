@@ -291,13 +291,15 @@ async def resolve_dns_doh(host: str, doh_url: str) -> str:
     return None
 
 # --- Traffic Hooks ---
+args_script_path: Optional[str] = None
 async def default_intercept_response(body: bytes, headers: dict, status: int) -> tuple[bytes, dict, int]:
     return body, headers, status
 
 intercept_response_hook = default_intercept_response
 
 def load_script(path: str):
-    global intercept_response_hook
+    global intercept_response_hook, args_script_path
+    args_script_path = path
     try:
         import importlib.util
         spec = importlib.util.spec_from_file_location("user_script", path)
@@ -307,7 +309,9 @@ def load_script(path: str):
             intercept_response_hook = module.intercept_response
             logger.info(f"Loaded response hook from {path}")
     except Exception as e:
-        logger.error(f"Failed to load script {path}: {e}")
+        logger.error(f"Error in user script '{path}': {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         sys.exit(1)
 
 # --- Proxy Logic ---
@@ -394,7 +398,16 @@ async def proxy_handler(request: web.Request):
                     k_lower = k.lower()
                     if k_lower not in ('content-length', 'content-encoding', 'transfer-encoding', 'connection', 'server'):
                         out_headers[k] = v
-                body, out_headers, status = await intercept_response_hook(body, out_headers, resp.status)
+                
+                try:
+                    body, out_headers, status = await intercept_response_hook(body, out_headers, resp.status)
+                except Exception as e:
+                    logger.error(f"Error executing intercept_response in '{args_script_path}': {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    # Continue with original data if hook fails? Or return 500?
+                    # Let's return the original data but log the error clearly.
+
                 return web.Response(body=body, status=status, headers=out_headers)
     except Exception as e:
         logger.error(f"Upstream error: {e}")
