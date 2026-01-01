@@ -304,27 +304,39 @@ async def proxy_handler(request: web.Request):
     port = request.url.port or (443 if scheme == 'https' else 80)
     target_url = f"{scheme}://{real_ip}:{port}{request.path_qs}"
 
-    req_headers = {k: v for k, v in request.headers.items() if k.lower() not in ('host', 'content-length')}
+    req_headers = {k: v for k, v in request.headers.items() if k.lower() not in ('host', 'content-length', 'connection')}
     req_headers['Host'] = host
+    # aiohttp handles connection management, so we remove 'connection' from request headers
+    # and we definitely should not be sending 'transfer-encoding' if we read the whole body
+    if 'transfer-encoding' in req_headers:
+        del req_headers['transfer-encoding']
+    
     req_body = await request.read()
     
-    ssl_ctx = None
+    ssl_ctx_upstream = None
     if scheme == 'https':
-        ssl_ctx = ssl.create_default_context()
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode = ssl.CERT_NONE
+        ssl_ctx_upstream = ssl.create_default_context()
+        ssl_ctx_upstream.check_hostname = False
+        ssl_ctx_upstream.verify_mode = ssl.CERT_NONE
 
     try:
         async with aiohttp.ClientSession(auto_decompress=False) as session:
             async with session.request(
                 request.method, target_url, headers=req_headers, data=req_body,
-                ssl=ssl_ctx, server_hostname=hostname if scheme == 'https' else None,
+                ssl=ssl_ctx_upstream, server_hostname=hostname if scheme == 'https' else None,
                 allow_redirects=False
             ) as resp:
                 body = await resp.read()
-                out_headers = {k: v for k, v in resp.headers.items() 
-                               if k.lower() not in ('content-length', 'content-encoding', 'transfer-encoding', 'connection')}
+                out_headers = {}
+                for k, v in resp.headers.items():
+                    # aiohttp response headers keys/values are strings
+                    k_lower = k.lower()
+                    if k_lower not in ('content-length', 'content-encoding', 'transfer-encoding', 'connection', 'server'):
+                        out_headers[k] = v
+                
+                # Apply hook
                 body, out_headers, status = await intercept_response_hook(body, out_headers, resp.status)
+                
                 return web.Response(body=body, status=status, headers=out_headers)
     except Exception as e:
         logger.error(f"Upstream error: {e}")
