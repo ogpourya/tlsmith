@@ -291,57 +291,61 @@ async def resolve_doh(host: str, doh_url: str) -> str:
             logger.error(f"DoH error for {host} via {doh_url}: {e}")
     return ""
 
+# --- Traffic Hooks ---
+# Default hooks (can be overridden by external script)
+async def default_intercept_response(body: bytes, headers: dict, status: int) -> tuple[bytes, dict, int]:
+    # Default behavior: Passthrough
+    return body, headers, status
+
+intercept_response_hook = default_intercept_response
+
+def load_script(path: str):
+    global intercept_response_hook
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("user_script", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        
+        if hasattr(module, "intercept_response"):
+            intercept_response_hook = module.intercept_response
+            logger.info(f"Loaded response hook from {path}")
+        else:
+            logger.warning(f"No 'intercept_response' function found in {path}")
+            
+    except Exception as e:
+        logger.error(f"Failed to load script {path}: {e}")
+        sys.exit(1)
+
 # --- Proxy Logic ---
 async def proxy_handler(request: web.Request):
     host = request.host
     if ":" in host:
         hostname = host.split(":")[0]
-    else:
-        hostname = host
-    
-    logger.info(f"{request.method} {request.url}")
-
-    real_ip = None
+# ...
+    # Resolution
+# ...
+    # SSL Context
+# ...
     try:
-        info = await asyncio.get_event_loop().getaddrinfo(hostname, None)
-        ips = [x[4][0] for x in info]
+        # Hook: Request
+        # Note: Modifying aiohttp Request object in place is tricky, simpler to modify params we pass to session.request
+        # For this simple tool, we'll just log in the hook above or allow simple side effects.
+        # To truly modify request body/headers easily:
         
-        for ip in ips:
-            if not ip.startswith("127.") and ip != "::1":
-                real_ip = ip
-                break
+        req_headers = {k: v for k, v in request.headers.items() if k.lower() not in ('host', 'content-length')}
+        req_headers['Host'] = host
+        req_body = await request.read()
         
-        if not real_ip:
-            logger.info(f"Loopback detected for {hostname}, bypassing local hosts via DoH ({DOH_URL})...")
-            real_ip = await resolve_doh(hostname, DOH_URL)
-            
-        if not real_ip:
-            return web.Response(text=f"Could not resolve {hostname}", status=502)
-            
-    except Exception as e:
-        logger.error(f"Resolution error: {e}")
-        return web.Response(text="DNS Error", status=502)
+        # Call request hook (conceptual - for now just pass through)
+        # await intercept_request(request) 
 
-    scheme = request.scheme
-    port = request.url.port or (443 if scheme == 'https' else 80)
-    target_url = f"{scheme}://{real_ip}:{port}{request.path_qs}"
-    
-    headers = {k: v for k, v in request.headers.items() if k.lower() not in ('host', 'content-length')}
-    headers['Host'] = host
-    
-    ssl_ctx = None
-    if scheme == 'https':
-        ssl_ctx = ssl.create_default_context()
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode = ssl.CERT_NONE
-
-    try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(auto_decompress=False) as session:
             async with session.request(
                 request.method, 
                 target_url, 
-                headers=headers, 
-                data=request.content,
+                headers=req_headers, 
+                data=req_body,
                 ssl=ssl_ctx,
                 server_hostname=hostname if scheme == 'https' else None,
                 allow_redirects=False
@@ -349,9 +353,20 @@ async def proxy_handler(request: web.Request):
                 body = await resp.read()
                 out_headers = {k: v for k, v in resp.headers.items() 
                                if k.lower() not in ('content-length', 'content-encoding', 'transfer-encoding', 'connection')}
-                out_headers['Date'] = "Sat, 01 Jan 2099 00:00:00 GMT"
-                return web.Response(body=body, status=resp.status, headers=out_headers)
+                
+                # Hook: Response
+                if intercept_response_hook:
+                    try:
+                        body, out_headers, status = await intercept_response_hook(body, out_headers, resp.status)
+                    except Exception as e:
+                        logger.error(f"Response hook error: {e}")
+                        status = resp.status
+                else:
+                    status = resp.status
+
+                return web.Response(body=body, status=status, headers=out_headers)
     except Exception as e:
+
         logger.error(f"Upstream error: {e}")
         return web.Response(text=f"Upstream Error: {e}", status=502)
 
@@ -374,6 +389,7 @@ def main():
     parser = argparse.ArgumentParser(description="MITM Proxy & Host Spoofer")
     parser.add_argument("--reset", action="store_true", help="Remove CA and config, then exit")
     parser.add_argument("--doh", default="https://sky.rethinkdns.com/dns-query", help="DoH Resolver URL")
+    parser.add_argument("--script", help="Path to Python script with interception hooks")
     parser.add_argument("domains", nargs="*", help="Domains to intercept (e.g. example.com). Can also be a file path containing domains.")
     args = parser.parse_args()
 
@@ -388,6 +404,9 @@ def main():
         sys.exit(0)
 
     DOH_URL = args.doh
+    
+    if args.script:
+        load_script(args.script)
 
     # Process domains
     domains_to_add = []

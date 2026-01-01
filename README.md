@@ -4,7 +4,6 @@ A lab-only tool for intercepting and modifying HTTP/HTTPS traffic with dynamic T
 
 ## Features
 - **Dynamic TLS**: Generates leaf certificates on-the-fly for any domain using a local Root CA.
-- **TUI**: Simple two-pane interface (Logs & Input) for managing intercepted domains.
 - **Loopback Bypass**: Intelligently bypasses local `/etc/hosts` overrides using DNS-over-HTTPS.
 - **Scriptable**: Python-based proxy logic for easy request/response modification.
 
@@ -28,12 +27,32 @@ sudo $(which tlsmith) domains.txt
 
 1. **Trust CA**: On first run, a Root CA is generated at `~/.config/tlsmith/ca.crt`. Import this into your browser/OS trust store (or run on Debian/Ubuntu for auto-install).
 2. **Intercepts**: `tlsmith` automatically updates `/etc/hosts` to point these domains to `127.0.0.1`.
-3. **Proxies**: Traffic is decrypted, modified (e.g. Date header), and forwarded to the *real* upstream via DNS-over-HTTPS.
+3. **Proxies**: Traffic is decrypted, modified (if --script provided), and forwarded to the *real* upstream via DNS-over-HTTPS.
+
+## Scripting
+
+You can modify traffic by providing a Python script via `--script`:
+
+```python
+# my_hooks.py
+async def intercept_response(body: bytes, headers: dict, status: int) -> tuple[bytes, dict, int]:
+    # Example: Inject script into HTML
+    if b"text/html" in headers.get("Content-Type", b"").lower():
+        body = body.replace(b"</body>", b"<script>alert('Pwned');</script></body>")
+        
+    # Example: Modify headers
+    headers['X-Intercepted-By'] = 'TLSmith'
+    
+    return body, headers, status
+```
+
+Run with: `sudo tlsmith --script my_hooks.py example.com`
 
 ## Options
 
 - `--reset`: Remove CA and configuration files, clean up `/etc/hosts`, then exit.
 - `--doh <url>`: Specify a custom DNS-over-HTTPS resolver (default: `https://sky.rethinkdns.com/dns-query`).
+- `--script <path>`: Load Python script for request/response modification.
 
 ## Safety Warning
 

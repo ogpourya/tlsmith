@@ -25,14 +25,9 @@ echo "Installing dependencies..."
 uv sync
 
 echo "Starting tlsmith with CLI args..."
-# Now passing domains via CLI directly
-# NOTE: We are passing example.com, so tlsmith should handle /etc/hosts injection itself!
-# We no longer need to manually inject into /etc/hosts in this script if tlsmith does it.
-# The previous version used headless + manual injection. 
-# New requirement: "accepts any domains... file or list... always add www too yourself"
-# tlsmith automatically adds to /etc/hosts.
-
-uv run tlsmith.py example.com > "$LOG_FILE" 2>&1 &
+# Note: tlsmith handles /etc/hosts injection.
+# We use hooks.py to enable the Date header modification for testing
+uv run tlsmith.py --script hooks.py example.com > "$LOG_FILE" 2>&1 &
 PID=$!
 
 echo "Waiting for server to start (10s)..."
