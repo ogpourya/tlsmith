@@ -4,8 +4,9 @@ A lab-only tool for intercepting and modifying HTTP/HTTPS traffic with dynamic T
 
 ## Features
 - **Dynamic TLS**: Generates leaf certificates on-the-fly for any domain using a local Root CA.
-- **Loopback Bypass**: Intelligently bypasses local `/etc/hosts` overrides using DNS-over-HTTPS (DoH).
+- **Loopback Bypass**: Intelligently bypasses local `/etc/hosts` overrides using DNS-over-HTTPS (DoH). If an upstream proxy is configured, DoH requests also use the proxy.
 - **Clean Logging**: Decodes and decompresses (gzip/deflate) HTTP bodies for clear inspection when using verbose mode.
+- **Proxy Support**: Supports upstream HTTP proxies for both traffic forwarding and DoH resolution.
 - **Scriptable**: Python-based proxy logic for easy request/response modification.
 
 ## Installation
@@ -19,6 +20,9 @@ uv tool install git+https://github.com/ogpourya/tlsmith.git
 ## Usage
 
 Run with `sudo` (required for ports 80/443 and `/etc/hosts` modification). If `sudo tlsmith` is not found in your path, use the `$(which tlsmith)` subshell:
+
+> [!IMPORTANT]
+> `tlsmith` only works with domains, not raw IP addresses.
 
 ```bash
 sudo tlsmith example.com

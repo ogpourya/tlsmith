@@ -8,12 +8,15 @@ LOG_FILE="/tmp/tlsmith.log"
 cleanup() {
     echo "Cleaning up..."
     if [ ! -z "$PID" ]; then
-        sudo kill $PID || true
+        kill $PID || true
+    fi
+    if [ ! -z "$PROXY_PID" ]; then
+        kill $PROXY_PID || true
     fi
     if [ -f /etc/hosts.bak ]; then
         sudo mv /etc/hosts.bak /etc/hosts
     fi
-    # Reset tlsmith state for clean next run
+    # Reset tlsmith state for a clean next run
     uv run tlsmith.py --reset > /dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -24,10 +27,15 @@ uv run tlsmith.py --reset
 echo "Installing dependencies..."
 uv sync
 
+echo "Assuming proxy is already running at http://localhost:3333"
+# Do not start a new proxy, just check if something is listening
+if ! nc -z localhost 3333; then
+    echo "WARNING: No proxy detected at localhost:3333. Tests may fail!"
+fi
+
 echo "Starting tlsmith with CLI args..."
-# Note: tlsmith handles /etc/hosts injection.
-# We use hooks.py to enable the Date header modification for testing
-uv run tlsmith.py --script hooks.py example.com -v > "$LOG_FILE" 2>&1 &
+# tlsmith handles /etc/hosts injection and uses hooks.py for Date header modification
+uv run tlsmith.py icanhazip.com --proxy http://localhost:3333 --port 10080 --tls-port 10443 --script hooks.py  -v > "$LOG_FILE" 2>&1 &
 PID=$!
 
 echo "Waiting for server to start (10s)..."
@@ -51,15 +59,15 @@ sudo cp /etc/hosts /etc/hosts.bak
 
 # Verify /etc/hosts was updated by tlsmith
 echo "Checking /etc/hosts for injection..."
-if grep -q "example.com" /etc/hosts && grep -q "# tlsmith" /etc/hosts; then
+if grep -q "icanhazip.com" /etc/hosts && grep -q "# tlsmith" /etc/hosts; then
     echo "SUCCESS: /etc/hosts injected correctly."
 else
-    echo "FAILURE: example.com not found in /etc/hosts or missing marker."
+    echo "FAILURE: icanhazip.com not found in /etc/hosts or missing marker."
     cat /etc/hosts
     exit 1
 fi
 
-# Unset proxy to ensure we hit our local server
+# Unset proxy to ensure we hit our local server directly
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 
 echo "Waiting for CA generation..."
@@ -73,7 +81,13 @@ fi
 # --- Test 1: HTTPS ---
 echo "----------------------------------------------------------------"
 echo "Running HTTPS test..."
-OUTPUT_HTTPS=$(curl -v --cacert "$CA_CERT" https://example.com 2>&1) || echo "CURL FAILED: $?"
+# Get initial IP without proxy for comparison
+DIRECT_IP=$(curl -s https://icanhazip.com || echo "DIRECT_FAILED")
+echo "Direct IP: $DIRECT_IP"
+
+OUTPUT_HTTPS=$(curl -v --connect-to icanhazip.com:443:127.0.0.1:10443 --cacert "$CA_CERT" https://icanhazip.com 2>&1) || echo "CURL FAILED: $?"
+PROXY_IP_HTTPS=$(echo "$OUTPUT_HTTPS" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || echo "FAILED_TO_GET_IP")
+echo "Returned IP (HTTPS): $PROXY_IP_HTTPS"
 echo "$OUTPUT_HTTPS"
 
 if echo "$OUTPUT_HTTPS" | grep -q "Date: Sat, 01 Jan 2099 00:00:00 GMT"; then
@@ -86,7 +100,9 @@ fi
 # --- Test 2: HTTP ---
 echo "----------------------------------------------------------------"
 echo "Running HTTP test..."
-OUTPUT_HTTP=$(curl -v http://example.com 2>&1)
+OUTPUT_HTTP=$(curl -v --connect-to icanhazip.com:80:127.0.0.1:10080 http://icanhazip.com 2>&1)
+PROXY_IP_HTTP=$(echo "$OUTPUT_HTTP" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || echo "FAILED_TO_GET_IP")
+echo "Returned IP (HTTP): $PROXY_IP_HTTP"
 echo "$OUTPUT_HTTP"
 
 if echo "$OUTPUT_HTTP" | grep -q "Date: Sat, 01 Jan 2099 00:00:00 GMT"; then
@@ -96,5 +112,21 @@ else
     exit 1
 fi
 
+if [ "$DIRECT_IP" == "$PROXY_IP_HTTPS" ] || [ "$DIRECT_IP" == "$PROXY_IP_HTTP" ]; then
+    echo "FAILURE: Returned IP is the same as direct IP. Proxy might not be working."
+    exit 1
+else
+    echo "SUCCESS: Proxy IP ($PROXY_IP_HTTPS) differs from direct IP ($DIRECT_IP)."
+fi
+
 echo "----------------------------------------------------------------"
 echo "All tests passed!"
+
+echo "----------------------------------------------------------------"
+echo "Verifying Proxy Usage..."
+if grep -q "Using upstream proxy: http://localhost:3333" "$LOG_FILE"; then
+    echo "SUCCESS: Proxy usage logged in tlsmith.log"
+else
+    echo "FAILURE: Proxy usage NOT found in tlsmith.log"
+    exit 1
+fi

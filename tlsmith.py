@@ -216,7 +216,7 @@ async def resolve_dns_doh(host: str, doh_url: str) -> str:
             async with aiohttp.ClientSession() as session:
                 params = {"name": host, "type": "A"}
                 headers = {"accept": "application/dns-json"}
-                async with session.get(doh_url, params=params, headers=headers) as resp:
+                async with session.get(doh_url, params=params, headers=headers, proxy=PROXY_URL) as resp:
                     if resp.status == 200:
                         data = await resp.json(content_type=None)
                         if "Answer" in data:
@@ -294,6 +294,9 @@ async def proxy_handler(request: web.Request):
         except Exception:
             logger.debug(f"Request Body: <binary data {len(req_body)} bytes>")
     
+    if PROXY_URL and real_ip.startswith("127."):
+        logger.warning(f"Target {hostname} resolved to loopback ({real_ip}). Proxying loopback traffic may fail depending on upstream proxy configuration.")
+
     ssl_ctx_upstream = None
     if scheme == 'https':
         ssl_ctx_upstream = ssl.create_default_context()
@@ -302,10 +305,13 @@ async def proxy_handler(request: web.Request):
 
     try:
         async with aiohttp.ClientSession(auto_decompress=True) as session:
+            if PROXY_URL:
+                logger.debug(f"Using upstream proxy: {PROXY_URL}")
             async with session.request(
                 request.method, target_url, headers=req_headers, data=req_body,
                 ssl=ssl_ctx_upstream, server_hostname=hostname if scheme == 'https' else None,
-                allow_redirects=False
+                allow_redirects=False,
+                proxy=PROXY_URL
             ) as resp:
                 body = await resp.read()
                 if logger.level <= logging.DEBUG:
@@ -338,45 +344,55 @@ def sni_callback(ssl_socket, server_name, initial_context):
 # --- Main ---
 ca = CertificateAuthority()
 DNS_SERVER = "https://cloudflare-dns.com/dns-query"
+PROXY_URL: Optional[str] = None
 
 import argparse
 
 def main():
-    global DNS_SERVER
+    global DNS_SERVER, PROXY_URL
     parser = argparse.ArgumentParser(description="MITM Proxy & Host Spoofer")
     parser.add_argument("--reset", action="store_true", help="Remove CA and config, then exit")
     parser.add_argument("--dns", default="https://cloudflare-dns.com/dns-query", help="DoH Server URL to bypass hosts file")
+    parser.add_argument("--proxy", help="Upstream proxy URL (e.g. http://localhost:3333)")
+    parser.add_argument("--port", type=int, default=80, help="HTTP listen port")
+    parser.add_argument("--tls-port", type=int, default=443, help="HTTPS listen port")
     parser.add_argument("--script", help="Path to Python script with interception hooks")
     parser.add_argument("-v", "--verbose", action="store_true", help="Show verbose request/response logs")
     parser.add_argument("domains", nargs="*", help="Domains to intercept.")
     args = parser.parse_args()
 
     if args.verbose:
-        logger.setLevel(logging.DEBUG)
+        level = logging.DEBUG
     else:
-        logger.setLevel(logging.INFO)
+        level = logging.INFO
 
-    logging.basicConfig(level=logger.level, format="%(asctime)s - %(message)s")
+    logging.basicConfig(level=level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    logger.setLevel(level)
+
     if args.reset:
         HostsManager.remove_all()
         if CA_CERT_FILE.exists(): CA_CERT_FILE.unlink()
         if CA_KEY_FILE.exists(): CA_KEY_FILE.unlink()
         sys.exit(0)
 
+    if not args.domains:
+        logger.error("No domains specified. Please provide at least one domain to intercept.")
+        sys.exit(1)
+
     DNS_SERVER = args.dns
+    PROXY_URL = args.proxy
     if args.script: load_script(args.script)
 
-    if args.domains:
-        print("\n[WARNING] Modifying /etc/hosts to intercept traffic.")
-        print("[WARNING] If this tool crashes, run with --reset to clean up.\n")
-        domains_to_add = []
-        for d in args.domains:
-            path = Path(d)
-            if path.exists() and path.is_file():
-                with open(path, 'r') as f: domains_to_add.extend([line.strip() for line in f if line.strip()])
-            else: domains_to_add.extend(d.split(","))
-        for d in set(domains_to_add):
-            if d: HostsManager.add_domain(d.strip())
+    print("\n[WARNING] Modifying /etc/hosts to intercept traffic.")
+    print("[WARNING] If this tool crashes, run with --reset to clean up.\n")
+    domains_to_add = []
+    for d in args.domains:
+        path = Path(d)
+        if path.exists() and path.is_file():
+            with open(path, 'r') as f: domains_to_add.extend([line.strip() for line in f if line.strip()])
+        else: domains_to_add.extend(d.split(","))
+    for d in set(domains_to_add):
+        if d: HostsManager.add_domain(d.strip())
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -385,12 +401,12 @@ def main():
         app.router.add_route('*', '/{path_info:.*}', proxy_handler)
         runner = web.AppRunner(app)
         await runner.setup()
-        await web.TCPSite(runner, '0.0.0.0', 80).start()
+        await web.TCPSite(runner, '0.0.0.0', args.port).start()
         ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ssl_ctx.load_cert_chain(CA_CERT_FILE, CA_KEY_FILE)
         ssl_ctx.set_servername_callback(sni_callback)
-        await web.TCPSite(runner, '0.0.0.0', 443, ssl_context=ssl_ctx).start()
-        logger.info("Listening on :80 and :443")
+        await web.TCPSite(runner, '0.0.0.0', args.tls_port, ssl_context=ssl_ctx).start()
+        logger.info(f"Listening on :{args.port} and :{args.tls_port}")
         while True: await asyncio.sleep(3600)
     try:
         loop.run_until_complete(run_server())
