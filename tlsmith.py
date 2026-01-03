@@ -278,29 +278,16 @@ class HostsManager:
         if proc.returncode != 0:
             logger.error(f"Sudo write failed: {err.decode()}")
 
-# --- DNS Helper ---
-async def resolve_dns_doh(host: str, doh_url: str) -> str:
-    """DNS-over-HTTPS implementation to bypass /etc/hosts."""
-    for attempt in range(1, 4):
-        try:
-            async with aiohttp.ClientSession() as session:
-                params = {"name": host, "type": "A"}
-                headers = {"accept": "application/dns-json"}
-                async with session.get(doh_url, params=params, headers=headers, proxy=PROXY_URL) as resp:
-                    if resp.status == 200:
-                        data = await resp.json(content_type=None)
-                        if "Answer" in data:
-                            for answer in data["Answer"]:
-                                if answer["type"] == 1:  # A record
-                                    return answer["data"]
-            if attempt < 3:
-                logger.warning(f"DoH attempt {attempt} failed for {host}, retrying...")
-        except Exception as e:
-            if attempt < 3:
-                logger.warning(f"DoH attempt {attempt} failed for {host}: {e}. Retrying...")
-            else:
-                logger.error(f"jesuss we failed: DoH error for {host} via {doh_url}: {e}")
-                logger.warning("Warning: low quality DNS detected. Consider using a more reliable DoH provider.")
+# --- Utils ---
+def get_default_interface() -> Optional[str]:
+    try:
+        with open("/proc/net/route") as f:
+            for line in f:
+                fields = line.strip().split()
+                if len(fields) >= 2 and fields[1] == '00000000':
+                    return fields[0]
+    except Exception as e:
+        logger.debug(f"Could not determine default interface: {e}")
     return None
 
 # --- Traffic Hooks ---
@@ -355,8 +342,9 @@ async def proxy_handler(request: web.Request):
                     real_ip = ip
                     break
             if not real_ip:
-                logger.info(f"Loopback detected for {hostname}, bypassing via DoH ({DNS_SERVER})...")
-                real_ip = await resolve_dns_doh(hostname, DNS_SERVER)
+                # Check pre-resolved map
+                real_ip = DOMAIN_MAP.get(hostname)
+            
             if not real_ip:
                 return web.Response(text=f"Could not resolve {hostname}", status=502)
         except Exception as e:
@@ -427,21 +415,24 @@ async def proxy_handler(request: web.Request):
         return web.Response(text=f"Upstream Error: {e}", status=502)
 
 # --- Main ---
-ca = CertificateAuthority()
-DNS_SERVER = "https://cloudflare-dns.com/dns-query"
+ca: Optional[CertificateAuthority] = None
 PROXY_URL: Optional[str] = None
+DOMAIN_MAP: Dict[str, str] = {}
+INTERCEPTED_IPS: set = set()
+DEFAULT_INTERFACE: Optional[str] = None
 
 import argparse
 
 def main():
-    global DNS_SERVER, PROXY_URL
+    global PROXY_URL, DOMAIN_MAP, INTERCEPTED_IPS, DEFAULT_INTERFACE, ca
     parser = argparse.ArgumentParser(description="MITM Proxy & Host Spoofer")
     parser.add_argument("--reset", action="store_true", help="Remove CA and config, then exit")
-    parser.add_argument("--dns", default="https://cloudflare-dns.com/dns-query", help="DoH Server URL to bypass hosts file")
     parser.add_argument("--proxy", help="Upstream proxy URL (e.g. http://localhost:3333)")
     parser.add_argument("--script", help="Path to Python script with interception hooks")
+    parser.add_argument("--port", type=int, default=80, help="HTTP port to listen on (default 80)")
+    parser.add_argument("--tls-port", type=int, default=443, help="HTTPS port to listen on (default 443)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Show verbose request/response logs")
-    parser.add_argument("domains", nargs="*", help="Domains to intercept.")
+    parser.add_argument("domains", nargs="*", help="Domains or IPs to intercept.")
     args = parser.parse_args()
 
     if args.verbose:
@@ -451,6 +442,9 @@ def main():
 
     logging.basicConfig(level=level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     logger.setLevel(level)
+    
+    # Initialize CA after logging is configured so user sees output
+    ca = CertificateAuthority()
 
     if args.reset:
         HostsManager.remove_all()
@@ -462,44 +456,51 @@ def main():
         logger.error("No domains specified. Please provide at least one domain to intercept.")
         sys.exit(1)
 
-    DNS_SERVER = args.dns
     PROXY_URL = args.proxy
     if args.script: load_script(args.script)
 
     print("\n[WARNING] Modifying /etc/hosts and routing table to intercept traffic.")
-    print("[WARNING] IP support requires an upstream --proxy to reach the original destination.")
+    if not PROXY_URL:
+        print("[WARNING] Running without upstream proxy. IP interception will use SO_BINDTODEVICE if available.")
     print("[WARNING] If this tool crashes, run with --reset to clean up.\n")
+    
+    global INTERCEPTED_IPS, DEFAULT_INTERFACE
+    INTERCEPTED_IPS = set()
+    DEFAULT_INTERFACE = get_default_interface()
     
     intercepted_ips = []
 
     try:
         domains_to_add = []
         ips_to_route = []
+        
+        def add_item(item):
+            item = item.strip()
+            if not item: return
+            try:
+                ipaddress.ip_address(item)
+                ips_to_route.append(item)
+            except ValueError:
+                # Pre-resolve domain
+                try:
+                    resolved = socket.gethostbyname(item)
+                    DOMAIN_MAP[item] = resolved
+                    domains_to_add.append(item)
+                    if not item.startswith("www."):
+                        try:
+                            wip = socket.gethostbyname(f"www.{item}")
+                            DOMAIN_MAP[f"www.{item}"] = wip
+                        except: pass
+                except Exception as e:
+                    logger.warning(f"Could not resolve {item}: {e}")
+
         for d in args.domains:
             path = Path(d)
             if path.exists() and path.is_file():
                 with open(path, 'r') as f: 
-                    for line in f:
-                        item = line.strip()
-                        if item:
-                            try:
-                                ipaddress.ip_address(item)
-                                ips_to_route.append(item)
-                            except ValueError:
-                                domains_to_add.append(item)
+                    for line in f: add_item(line)
             else:
-                for item in d.split(","):
-                    item = item.strip()
-                    if item:
-                        try:
-                            ipaddress.ip_address(item)
-                            ips_to_route.append(item)
-                        except ValueError:
-                            domains_to_add.append(item)
-
-        if ips_to_route and not PROXY_URL:
-            logger.error("IP interception requires an upstream --proxy. Exit.")
-            sys.exit(1)
+                for item in d.split(","): add_item(item)
 
         for d in set(domains_to_add):
             HostsManager.add_domain(d)
@@ -507,9 +508,28 @@ def main():
         for ip in set(ips_to_route):
             RoutingManager.add_ip_route(ip)
             intercepted_ips.append(ip)
+            INTERCEPTED_IPS.add(ip)
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+
+        # Monkeypatch for IP binding
+        if ips_to_route and not PROXY_URL and DEFAULT_INTERFACE:
+            logger.info(f"Enabling SO_BINDTODEVICE on {DEFAULT_INTERFACE}")
+            original_create_connection = loop.create_connection
+
+            async def patched_create_connection(protocol_factory, host=None, port=None, *args, **kwargs):
+                if host in INTERCEPTED_IPS:
+                    try:
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        sock.setsockopt(socket.SOL_SOCKET, 25, DEFAULT_INTERFACE.encode())
+                        kwargs['sock'] = sock
+                        logger.debug(f"Binding connection to {host} via {DEFAULT_INTERFACE}")
+                    except Exception as e:
+                        logger.error(f"Failed to bind socket: {e}")
+                return await original_create_connection(protocol_factory, host, port, *args, **kwargs)
+            
+            loop.create_connection = patched_create_connection
 
         def sni_callback(ssl_socket, server_name, initial_context):
             target = server_name
@@ -547,7 +567,7 @@ def main():
             await runner.setup()
             
             # Listen on all interfaces for port 80
-            await web.TCPSite(runner, '0.0.0.0', 80).start()
+            await web.TCPSite(runner, '0.0.0.0', args.port).start()
             
             # For each intercepted IP, we use a custom context immediately 
             # if we want to be sure it works without SNI-to-IP resolution issues.
@@ -557,7 +577,7 @@ def main():
                     # We still set the SNI callback just in case someone uses a hostname 
                     # that points to this IP.
                     ip_ctx.set_servername_callback(sni_callback)
-                    await web.TCPSite(runner, ip, 443, ssl_context=ip_ctx).start()
+                    await web.TCPSite(runner, ip, args.tls_port, ssl_context=ip_ctx).start()
                     logger.info(f"Dedicated listener started for intercepted IP: {ip}")
                 except Exception as e:
                     logger.error(f"Failed to start listener for {ip}: {e}")
@@ -566,17 +586,20 @@ def main():
             ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             ssl_ctx.load_cert_chain(CA_CERT_FILE, CA_KEY_FILE)
             ssl_ctx.set_servername_callback(sni_callback)
-            await web.TCPSite(runner, '127.0.0.1', 443, ssl_context=ssl_ctx).start()
+            await web.TCPSite(runner, '127.0.0.1', args.tls_port, ssl_context=ssl_ctx).start()
             
-            logger.info("Listening on :80 and :443")
+            logger.info(f"Listening on :{args.port} and :{args.tls_port}")
             while True: await asyncio.sleep(3600)
         
         loop.run_until_complete(run_server())
     except KeyboardInterrupt:
         pass
     finally:
+        logger.info("Cleaning up routing table and hosts file...")
         for ip in intercepted_ips:
             RoutingManager.remove_ip_route(ip)
+        # Also clean up hosts entries
+        HostsManager.remove_all()
 
 if __name__ == "__main__":
     main()
