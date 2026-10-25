@@ -4,7 +4,7 @@ A lab-only tool for intercepting and modifying HTTP/HTTPS traffic with dynamic T
 
 ## Features
 - **Dynamic TLS**: On-the-fly leaf certificates for any domain or IP.
-- **IP Interception**: Redirects raw IP traffic using system routing table (supports `SO_BINDTODEVICE` to bypass loops without a proxy).
+- **IP Interception**: Redirects raw IP traffic using system routing table (supports `SO_BINDTODEVICE` to avoid loops).
 - **Host Spoofing**: Automatically updates `/etc/hosts` for domain interception.
 - **Scriptable**: Python hooks for request/response modification.
 
@@ -25,7 +25,7 @@ sudo tlsmith example.com
 # Intercept multiple domains
 sudo tlsmith example.com google.com
 
-# Intercept IPs (works without upstream proxy on Linux)
+# Intercept IPs
 sudo tlsmith 1.1.1.1 8.8.8.8
 
 # Use custom ports
@@ -63,7 +63,6 @@ sudo tlsmith example.com --script my_hooks.py
 ```
 
 ## Options
-- `--proxy <url>`: Upstream proxy URL (optional, e.g., `http://localhost:8080`).
 - `--script <path>`: Python script with `intercept_response` hook.
 - `--port <int>`: HTTP port to listen on (default: 80).
 - `--tls-port <int>`: HTTPS port to listen on (default: 443).

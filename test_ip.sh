@@ -22,15 +22,9 @@ uv run tlsmith.py --reset
 echo "Installing dependencies..."
 uv sync
 
-echo "Checking for upstream proxy at http://localhost:3333..."
-if ! nc -z localhost 3333; then
-    echo "ERROR: IP interception requires an upstream proxy. Start one first!"
-    exit 1
-fi
-
 echo "Starting tlsmith for IP $TEST_IP..."
 # Run as sudo to allow port 80/443 binding and ip addr modification
-sudo $(which python3) tlsmith.py "$TEST_IP" example.com --proxy http://localhost:3333 --script hooks.py -v > "$LOG_FILE" 2>&1 &
+sudo "$PWD/.venv/bin/python" tlsmith.py "$TEST_IP" example.com --script hooks.py -v > "$LOG_FILE" 2>&1 &
 PID=$!
 
 echo "Waiting for server to start (10s)..."
@@ -56,7 +50,7 @@ else
     exit 1
 fi
 
-# Unset proxy to ensure curl hits the local interface
+# Ignore any system proxy environment variables
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 
 echo "Waiting for CA generation..."

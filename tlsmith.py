@@ -365,8 +365,8 @@ async def proxy_handler(request: web.Request):
         except Exception:
             logger.debug(f"Request Body: <binary data {len(req_body)} bytes>")
     
-    if PROXY_URL and real_ip.startswith("127."):
-        logger.warning(f"Target {hostname} resolved to loopback ({real_ip}). Proxying loopback traffic may fail depending on upstream proxy configuration.")
+    if real_ip.startswith("127."):
+        logger.warning(f"Target {hostname} resolved to loopback ({real_ip}). Upstream requests may loop back.")
 
     ssl_ctx_upstream = None
     if scheme == 'https':
@@ -376,13 +376,10 @@ async def proxy_handler(request: web.Request):
 
     try:
         async with aiohttp.ClientSession(auto_decompress=True) as session:
-            if PROXY_URL:
-                logger.debug(f"Using upstream proxy: {PROXY_URL}")
             async with session.request(
                 request.method, target_url, headers=req_headers, data=req_body,
                 ssl=ssl_ctx_upstream, server_hostname=hostname if scheme == 'https' else None,
-                allow_redirects=False,
-                proxy=PROXY_URL
+                allow_redirects=False
             ) as resp:
                 body = await resp.read()
                 if logger.level <= logging.DEBUG:
@@ -416,7 +413,6 @@ async def proxy_handler(request: web.Request):
 
 # --- Main ---
 ca: Optional[CertificateAuthority] = None
-PROXY_URL: Optional[str] = None
 DOMAIN_MAP: Dict[str, str] = {}
 INTERCEPTED_IPS: set = set()
 DEFAULT_INTERFACE: Optional[str] = None
@@ -424,10 +420,9 @@ DEFAULT_INTERFACE: Optional[str] = None
 import argparse
 
 def main():
-    global PROXY_URL, DOMAIN_MAP, INTERCEPTED_IPS, DEFAULT_INTERFACE, ca
+    global DOMAIN_MAP, INTERCEPTED_IPS, DEFAULT_INTERFACE, ca
     parser = argparse.ArgumentParser(description="MITM Proxy & Host Spoofer")
     parser.add_argument("--reset", action="store_true", help="Remove CA and config, then exit")
-    parser.add_argument("--proxy", help="Upstream proxy URL (e.g. http://localhost:3333)")
     parser.add_argument("--script", help="Path to Python script with interception hooks")
     parser.add_argument("--port", type=int, default=80, help="HTTP port to listen on (default 80)")
     parser.add_argument("--tls-port", type=int, default=443, help="HTTPS port to listen on (default 443)")
@@ -456,12 +451,10 @@ def main():
         logger.error("No domains specified. Please provide at least one domain to intercept.")
         sys.exit(1)
 
-    PROXY_URL = args.proxy
     if args.script: load_script(args.script)
 
     print("\n[WARNING] Modifying /etc/hosts and routing table to intercept traffic.")
-    if not PROXY_URL:
-        print("[WARNING] Running without upstream proxy. IP interception will use SO_BINDTODEVICE if available.")
+    print("[WARNING] IP interception uses SO_BINDTODEVICE when available.")
     print("[WARNING] If this tool crashes, run with --reset to clean up.\n")
     
     global INTERCEPTED_IPS, DEFAULT_INTERFACE
@@ -514,7 +507,7 @@ def main():
         asyncio.set_event_loop(loop)
 
         # Monkeypatch for IP binding
-        if ips_to_route and not PROXY_URL and DEFAULT_INTERFACE:
+        if ips_to_route and DEFAULT_INTERFACE:
             logger.info(f"Enabling SO_BINDTODEVICE on {DEFAULT_INTERFACE}")
             original_create_connection = loop.create_connection
 
