@@ -30,6 +30,8 @@ if sys.platform == "linux":
     CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP_NAME
 else:
     CONFIG_DIR = Path.home() / f".{APP_NAME}"
+# Set before re-executing under sudo so the CA stays in the invoking user's home.
+CONFIG_DIR = Path(os.environ.get("TLSMITH_CONFIG_DIR") or CONFIG_DIR)
 
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -37,6 +39,11 @@ CA_CERT_FILE = CONFIG_DIR / "ca.crt"
 CA_KEY_FILE = CONFIG_DIR / "ca.key"
 HOSTS_FILE = "/etc/hosts"
 MARKER = "# tlsmith"
+
+# Packets from tlsmith's own outbound sockets carry this mark so the
+# DNAT rules that redirect intercepted IPs skip them.
+DONT_INTERCEPT_MARK = 0x7473  # "ts"
+IPTABLES_CHAIN = "TLSMITH"
 
 # --- Logging Setup ---
 logger = logging.getLogger("tlsmith")
@@ -124,10 +131,17 @@ class CertificateAuthority:
         except ValueError:
             is_ip = False
 
-        key = ec.generate_private_key(ec.SECP256R1())
-        subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, hostname)])
-        
         san_list = [x509.IPAddress(ip_addr)] if is_ip else [x509.DNSName(hostname)]
+        return self._make_context(hostname, san_list)
+
+    def get_context_for_ips(self, ips) -> ssl.SSLContext:
+        # IP clients send no SNI, so one cert must cover every intercepted IP.
+        san_list = [x509.IPAddress(ipaddress.ip_address(ip)) for ip in ips]
+        return self._make_context("tlsmith", san_list)
+
+    def _make_context(self, common_name: str, san_list) -> ssl.SSLContext:
+        key = ec.generate_private_key(ec.SECP256R1())
+        subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
         
         cert = x509.CertificateBuilder().subject_name(
             subject
@@ -169,37 +183,56 @@ class CertificateAuthority:
 # --- Routing Manager ---
 class RoutingManager:
     @staticmethod
-    def check_nonlocal_bind():
-        if not sys.platform.startswith("linux"):
-            return
-        try:
-            with open("/proc/sys/net/ipv4/ip_nonlocal_bind", "r") as f:
-                if f.read().strip() != "1":
-                    logger.warning("net.ipv4.ip_nonlocal_bind is NOT enabled.")
-                    logger.warning("IP interception might fail. Fix with: sudo sysctl -w net.ipv4.ip_nonlocal_bind=1")
-        except Exception as e:
-            logger.debug(f"Could not check ip_nonlocal_bind: {e}")
+    def _iptables(*args):
+        cmd = ["iptables", "-t", "nat", *args]
+        if os.geteuid() != 0:
+            cmd.insert(0, "sudo")
+        return subprocess.run(cmd, capture_output=True, text=True)
 
     @staticmethod
-    def add_ip_route(ip: str):
-        RoutingManager.check_nonlocal_bind()
-        try:
-            # Add IP to lo interface so we can bind to it
-            subprocess.run(["sudo", "ip", "addr", "add", f"{ip}/32", "dev", "lo"], check=True, capture_output=True)
-            logger.info(f"Added address {ip} to lo")
-        except subprocess.CalledProcessError as e:
-            if "File exists" in e.stderr.decode():
-                logger.warning(f"Address {ip} already exists on lo")
-            else:
-                logger.error(f"Failed to add address {ip}: {e.stderr.decode()}")
+    def setup_ip_interception(ips, http_port: int, tls_port: int):
+        if not sys.platform.startswith("linux"):
+            logger.error("IP interception requires Linux (iptables).")
+            return
+        RoutingManager.teardown_ip_interception()
+        if RoutingManager._iptables("-N", IPTABLES_CHAIN).returncode != 0:
+            logger.error(f"Could not create iptables chain {IPTABLES_CHAIN}; IP interception disabled.")
+            return
+        RoutingManager._iptables("-I", "OUTPUT", "-j", IPTABLES_CHAIN)
+        for ip in ips:
+            try:
+                ipaddress.IPv4Address(ip)
+            except ValueError:
+                logger.warning(f"IP interception supports IPv4 only; skipping {ip}")
+                continue
+            RoutingManager.remove_ip_route(ip)
+            for port in (80, 443):
+                target_port = http_port if port == 80 else tls_port
+                result = RoutingManager._iptables(
+                    "-A", IPTABLES_CHAIN, "-d", ip, "-p", "tcp", "--dport", str(port),
+                    "-m", "mark", "!", "--mark", str(DONT_INTERCEPT_MARK),
+                    "-j", "DNAT", "--to-destination", f"127.0.0.1:{target_port}",
+                )
+                if result.returncode != 0:
+                    logger.error(f"Failed to add DNAT rule for {ip}:{port}: {result.stderr.strip()}")
+            logger.info(f"Redirecting {ip} to 127.0.0.1")
+
+    @staticmethod
+    def teardown_ip_interception():
+        if not sys.platform.startswith("linux"):
+            return
+        while RoutingManager._iptables("-D", "OUTPUT", "-j", IPTABLES_CHAIN).returncode == 0:
+            pass
+        RoutingManager._iptables("-F", IPTABLES_CHAIN)
+        RoutingManager._iptables("-X", IPTABLES_CHAIN)
 
     @staticmethod
     def remove_ip_route(ip: str):
-        try:
-            subprocess.run(["sudo", "ip", "addr", "del", f"{ip}/32", "dev", "lo"], check=True, capture_output=True)
-            logger.info(f"Removed address {ip} from lo")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to remove address {ip}: {e.stderr.decode()}")
+        # Older versions aliased intercepted IPs onto lo; drop such leftovers.
+        cmd = ["ip", "addr", "del", f"{ip}/32", "dev", "lo"]
+        if os.geteuid() != 0:
+            cmd.insert(0, "sudo")
+        subprocess.run(cmd, capture_output=True)
 
 # --- Hosts Manager ---
 class HostsManager:
@@ -250,22 +283,6 @@ class HostsManager:
                  print(f"Removed {len(lines) - len(new_lines)} entries from {HOSTS_FILE}")
             else:
                  print(f"No {MARKER} entries found in {HOSTS_FILE}.")
-
-            # Clean up IP addresses from 'lo'
-            try:
-                result = subprocess.run(["ip", "addr", "show", "dev", "lo"], capture_output=True, text=True)
-                for line in result.stdout.splitlines():
-                    # Look for 'inet 1.2.3.4/32'
-                    if "inet " in line and "/32" in line:
-                        parts = line.split()
-                        # parts[1] is '1.2.3.4/32'
-                        target = parts[1].split('/')[0]
-                        if target == "127.0.0.1": continue
-                        
-                        print(f"Removing lingering address {target} from lo...")
-                        RoutingManager.remove_ip_route(target)
-            except Exception as e:
-                logger.error(f"Failed to cleanup addresses: {e}")
         except Exception as e:
             logger.error(f"Failed to read hosts: {e}")
             return
@@ -273,22 +290,19 @@ class HostsManager:
     @staticmethod
     def _write_hosts(lines):
         content = "".join(lines)
+        if os.geteuid() == 0:
+            try:
+                with open(HOSTS_FILE, 'w') as f:
+                    f.write(content)
+            except Exception as e:
+                logger.error(f"Failed to write hosts: {e}")
+            return
         proc = subprocess.Popen(['sudo', 'tee', HOSTS_FILE], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         out, err = proc.communicate(input=content.encode('utf-8'))
         if proc.returncode != 0:
             logger.error(f"Sudo write failed: {err.decode()}")
 
 # --- Utils ---
-def get_default_interface() -> Optional[str]:
-    try:
-        with open("/proc/net/route") as f:
-            for line in f:
-                fields = line.strip().split()
-                if len(fields) >= 2 and fields[1] == '00000000':
-                    return fields[0]
-    except Exception as e:
-        logger.debug(f"Could not determine default interface: {e}")
-    return None
 
 # --- Traffic Hooks ---
 args_script_path: Optional[str] = None
@@ -315,6 +329,16 @@ def load_script(path: str):
         sys.exit(1)
 
 # --- Proxy Logic ---
+def _marked_socket(addr_info):
+    """Force tlsmith's own outbound traffic past the DNAT chain."""
+    # aiohappyeyeballs passes a plain (family, type, proto, ...) tuple.
+    family, type_, proto = addr_info[0], addr_info[1], addr_info[2]
+    sock = socket.socket(family, type_, proto)
+    sock.setsockopt(
+        socket.SOL_SOCKET, getattr(socket, "SO_MARK", 36), DONT_INTERCEPT_MARK
+    )
+    return sock
+
 async def proxy_handler(request: web.Request):
     host = request.host
     hostname = host.split(":")[0] if ":" in host else host
@@ -375,7 +399,8 @@ async def proxy_handler(request: web.Request):
         ssl_ctx_upstream.verify_mode = ssl.CERT_NONE
 
     try:
-        async with aiohttp.ClientSession(auto_decompress=True) as session:
+        connector = aiohttp.TCPConnector(socket_factory=_marked_socket) if INTERCEPTED_IPS else None
+        async with aiohttp.ClientSession(auto_decompress=True, connector=connector) as session:
             async with session.request(
                 request.method, target_url, headers=req_headers, data=req_body,
                 ssl=ssl_ctx_upstream, server_hostname=hostname if scheme == 'https' else None,
@@ -415,12 +440,23 @@ async def proxy_handler(request: web.Request):
 ca: Optional[CertificateAuthority] = None
 DOMAIN_MAP: Dict[str, str] = {}
 INTERCEPTED_IPS: set = set()
-DEFAULT_INTERFACE: Optional[str] = None
 
 import argparse
 
+def ensure_root():
+    """Re-exec under sudo so tlsmith can be started without `sudo`."""
+    if os.geteuid() == 0:
+        return
+    sudo = shutil.which("sudo")
+    if not sudo:
+        sys.exit("tlsmith needs root: install sudo or run it as root.")
+    os.execvp(sudo, [
+        sudo, "env", f"TLSMITH_CONFIG_DIR={CONFIG_DIR}",
+        sys.executable, *sys.argv,
+    ])
+
 def main():
-    global DOMAIN_MAP, INTERCEPTED_IPS, DEFAULT_INTERFACE, ca
+    global DOMAIN_MAP, INTERCEPTED_IPS, ca
     parser = argparse.ArgumentParser(description="MITM Proxy & Host Spoofer")
     parser.add_argument("--reset", action="store_true", help="Remove CA and config, then exit")
     parser.add_argument("--script", help="Path to Python script with interception hooks")
@@ -429,6 +465,7 @@ def main():
     parser.add_argument("-v", "--verbose", action="store_true", help="Show verbose request/response logs")
     parser.add_argument("domains", nargs="*", help="Domains or IPs to intercept.")
     args = parser.parse_args()
+    ensure_root()
 
     if args.verbose:
         level = logging.DEBUG
@@ -442,6 +479,7 @@ def main():
     ca = CertificateAuthority()
 
     if args.reset:
+        RoutingManager.teardown_ip_interception()
         HostsManager.remove_all()
         if CA_CERT_FILE.exists(): CA_CERT_FILE.unlink()
         if CA_KEY_FILE.exists(): CA_KEY_FILE.unlink()
@@ -453,15 +491,12 @@ def main():
 
     if args.script: load_script(args.script)
 
-    print("\n[WARNING] Modifying /etc/hosts and routing table to intercept traffic.")
-    print("[WARNING] IP interception uses SO_BINDTODEVICE when available.")
+    print("\n[WARNING] Modifying /etc/hosts and iptables to intercept traffic.")
+    print("[WARNING] IP interception adds temporary iptables NAT rules.")
     print("[WARNING] If this tool crashes, run with --reset to clean up.\n")
     
-    global INTERCEPTED_IPS, DEFAULT_INTERFACE
+    global INTERCEPTED_IPS
     INTERCEPTED_IPS = set()
-    DEFAULT_INTERFACE = get_default_interface()
-    
-    intercepted_ips = []
 
     try:
         domains_to_add = []
@@ -498,47 +533,18 @@ def main():
         for d in set(domains_to_add):
             HostsManager.add_domain(d)
         
-        for ip in set(ips_to_route):
-            RoutingManager.add_ip_route(ip)
-            intercepted_ips.append(ip)
-            INTERCEPTED_IPS.add(ip)
+        INTERCEPTED_IPS.update(ips_to_route)
+        if ips_to_route:
+            RoutingManager.setup_ip_interception(ips_to_route, args.port, args.tls_port)
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-        # Monkeypatch for IP binding
-        if ips_to_route and DEFAULT_INTERFACE:
-            logger.info(f"Enabling SO_BINDTODEVICE on {DEFAULT_INTERFACE}")
-            original_create_connection = loop.create_connection
-
-            async def patched_create_connection(protocol_factory, host=None, port=None, *args, **kwargs):
-                if host in INTERCEPTED_IPS:
-                    try:
-                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        sock.setsockopt(socket.SOL_SOCKET, 25, DEFAULT_INTERFACE.encode())
-                        kwargs['sock'] = sock
-                        logger.debug(f"Binding connection to {host} via {DEFAULT_INTERFACE}")
-                    except Exception as e:
-                        logger.error(f"Failed to bind socket: {e}")
-                return await original_create_connection(protocol_factory, host, port, *args, **kwargs)
-            
-            loop.create_connection = patched_create_connection
-
         def sni_callback(ssl_socket, server_name, initial_context):
+            if not server_name:
+                # No SNI: keep the listener's default cert (covers intercepted IPs).
+                return
             target = server_name
-            if not target:
-                try:
-                    # Use the socket's own address if SNI is missing
-                    sockname = ssl_socket.getsockname()
-                    target = sockname[0]
-                    # If target is 0.0.0.0, we can't do much without SNI
-                    if target == "0.0.0.0":
-                        logger.warning("SNI missing and socket bound to 0.0.0.0, cannot determine target IP")
-                        return
-                    logger.info(f"SNI missing, using socket IP: {target}")
-                except Exception as e:
-                    logger.error(f"Failed to get sockname: {e}")
-                    return
             
             logger.info(f"SNI Callback: targeting {target}")
             try:
@@ -561,23 +567,14 @@ def main():
             
             # Listen on all interfaces for port 80
             await web.TCPSite(runner, '0.0.0.0', args.port).start()
-            
-            # For each intercepted IP, we use a custom context immediately 
-            # if we want to be sure it works without SNI-to-IP resolution issues.
-            for ip in set(ips_to_route):
-                try:
-                    ip_ctx = ca.get_context_for_host(ip)
-                    # We still set the SNI callback just in case someone uses a hostname 
-                    # that points to this IP.
-                    ip_ctx.set_servername_callback(sni_callback)
-                    await web.TCPSite(runner, ip, args.tls_port, ssl_context=ip_ctx).start()
-                    logger.info(f"Dedicated listener started for intercepted IP: {ip}")
-                except Exception as e:
-                    logger.error(f"Failed to start listener for {ip}: {e}")
 
-            # For general domain traffic via 127.0.0.1
-            ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            ssl_ctx.load_cert_chain(CA_CERT_FILE, CA_KEY_FILE)
+            # Intercepted IPs are DNATed to 127.0.0.1. Clients using an IP
+            # send no SNI, so the default cert must cover them.
+            if ips_to_route:
+                ssl_ctx = ca.get_context_for_ips(ips_to_route)
+            else:
+                ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ssl_ctx.load_cert_chain(CA_CERT_FILE, CA_KEY_FILE)
             ssl_ctx.set_servername_callback(sni_callback)
             await web.TCPSite(runner, '127.0.0.1', args.tls_port, ssl_context=ssl_ctx).start()
             
@@ -588,9 +585,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        logger.info("Cleaning up routing table and hosts file...")
-        for ip in intercepted_ips:
-            RoutingManager.remove_ip_route(ip)
+        logger.info("Cleaning up iptables rules and hosts file...")
+        RoutingManager.teardown_ip_interception()
         # Also clean up hosts entries
         HostsManager.remove_all()
 

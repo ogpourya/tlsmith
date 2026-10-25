@@ -11,7 +11,7 @@ cleanup() {
     if [ ! -z "$PID" ]; then
         sudo kill $PID || true
     fi
-    # Reset tlsmith state for a clean next run (removes IP addresses from lo)
+    # Reset tlsmith state for a clean next run (removes iptables rules and leftover lo addresses)
     uv run tlsmith.py --reset > /dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -23,7 +23,7 @@ echo "Installing dependencies..."
 uv sync
 
 echo "Starting tlsmith for IP $TEST_IP..."
-# Run as sudo to allow port 80/443 binding and ip addr modification
+# Run as sudo to allow port 80/443 binding and iptables changes
 sudo "$PWD/.venv/bin/python" tlsmith.py "$TEST_IP" example.com --script hooks.py -v > "$LOG_FILE" 2>&1 &
 PID=$!
 
@@ -41,12 +41,14 @@ if ! sudo ps -p $PID > /dev/null; then
     exit 1
 fi
 
-# Verify IP was added to lo
-echo "Verifying $TEST_IP on lo interface..."
-if ip addr show dev lo | grep -q "$TEST_IP"; then
-    echo "SUCCESS: $TEST_IP found on lo."
+# Verify the IP is redirected by the DNAT chain
+echo "Verifying DNAT rules for $TEST_IP..."
+RULES=$(iptables -t nat -S TLSMITH 2>/dev/null | grep -c -- "-d $TEST_IP/32")
+if [ "$RULES" -ge 2 ]; then
+    echo "SUCCESS: $TEST_IP DNAT rules present."
 else
-    echo "FAILURE: $TEST_IP not found on lo."
+    echo "FAILURE: $TEST_IP DNAT rules not found."
+    iptables -t nat -S TLSMITH || true
     exit 1
 fi
 
@@ -63,7 +65,7 @@ echo "Running HTTPS IP Interception test..."
 OUTPUT_HTTPS=$(curl -v -s --cacert "$CA_CERT" --noproxy "*" "https://$TEST_IP" 2>&1) || echo "CURL FAILED"
 echo "$OUTPUT_HTTPS"
 
-if echo "$OUTPUT_HTTPS" | grep -qiE "subjectAltName: host \"$TEST_IP\" matched cert's (IP address!|IP Address: $TEST_IP)"; then
+if echo "$OUTPUT_HTTPS" | grep -qiE "subjectAltName:.*$TEST_IP.*(matches cert's IP address|IP Address: $TEST_IP)"; then
     echo "SUCCESS: IP SAN matched correctly."
 else
     echo "FAILURE: IP SAN mismatch or SSL error."
